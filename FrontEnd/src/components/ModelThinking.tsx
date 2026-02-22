@@ -68,7 +68,6 @@ export const ModelThinking: React.FC<ModelThinkingProps> = ({ signalData, isConn
   // Probability bar position (0-1 mapped to bar width)
   const probBarWidth = Math.max(0, Math.min(100, signal.probability * 100));
   const entryBarPos = signal.entry_threshold * 100;
-  const exitBarPos = signal.exit_threshold * 100;
 
   return (
     <div className="h-full rounded-lg overflow-hidden flex flex-col" style={{ backgroundColor: THEME_COLORS.CARD_BG }}>

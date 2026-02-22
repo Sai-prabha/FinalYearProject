@@ -677,16 +677,6 @@ function styleHeader(ws: Worksheet) {
   ws.views = [{ state: 'frozen', ySplit: 1 }];
 }
 
-/** Add a section header spanning columns A:B (for metric/value sheets). */
-function addSectionRow(ws: Worksheet, text: string) {
-  const row = ws.addRow({ metric: text, value: '' });
-  const cell = row.getCell(1);
-  cell.fill = SECTION_FILL;
-  cell.font = SECTION_FONT;
-  const cell2 = row.getCell(2);
-  cell2.fill = SECTION_FILL;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Sheet builders                                                     */
 /* ------------------------------------------------------------------ */
@@ -710,7 +700,6 @@ function buildDashboardSheet(
 
   const n = enriched.length;
   const wins = enriched.filter(t => t.pnl_dollar > 0).length;
-  const losses = n - wins;
   const totalPnL = n > 0 ? enriched[n - 1].cumulativePnl : 0;
   const finalBalance = startingBalance + totalPnL;
   const totalReturnPct = startingBalance > 0 ? (totalPnL / startingBalance) * 100 : 0;
@@ -1045,8 +1034,8 @@ function buildStatisticsSheet(
 // ── Sheet 5: Risk Metrics (NEW) ─────────────────────────────────────
 function buildRiskMetricsSheet(
   wb: Workbook,
-  enriched: EnrichedTrade[],
-  startingBalance: number,
+  _enriched: EnrichedTrade[],
+  _startingBalance: number,
   risk: RiskMetrics,
 ) {
   const ws = wb.addWorksheet('Risk Metrics');
@@ -1362,9 +1351,8 @@ async function buildTopFeaturesSheet(
 /*  Dev-mode validation helper                                         */
 /* ------------------------------------------------------------------ */
 function validateExport(enriched: EnrichedTrade[], startingBalance: number) {
-  if (typeof import.meta !== 'undefined' && !(import.meta as Record<string, unknown>).env) return;
+  if (typeof import.meta !== 'undefined' && !(import.meta as unknown as Record<string, unknown>).env) return;
   try {
-    // @ts-expect-error -- Vite-specific env check
     if (!import.meta.env?.DEV) return;
   } catch {
     return;
