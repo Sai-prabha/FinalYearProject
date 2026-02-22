@@ -1,0 +1,141 @@
+// Candlestick data structure
+export interface CandleData {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+// Price data for line charts
+export interface PriceData {
+  time: number;
+  value: number;
+}
+
+// Asset data with full state
+export interface AssetData {
+  symbol: string;
+  currentPrice: number;
+  change24h: number;
+  priceHistory: PriceData[];
+  connectionStatus: ConnectionStatus;
+  lastUpdate: number;
+}
+
+// Connection status type
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+// WebSocket kline event structure
+export interface KlineEvent {
+  e: string; // Event type
+  E: number; // Event time
+  s: string; // Symbol
+  k: {
+    t: number; // Kline start time
+    T: number; // Kline close time
+    s: string; // Symbol
+    i: string; // Interval
+    o: string; // Open price
+    c: string; // Close price
+    h: string; // High price
+    l: string; // Low price
+    v: string; // Volume
+    x: boolean; // Is this kline closed?
+  };
+}
+
+// Keep backward compat alias
+export type BinanceKlineEvent = KlineEvent;
+
+// WebSocket service callback types
+export type DataCallback = (data: CandleData) => void;
+export type StatusCallback = (status: ConnectionStatus) => void;
+
+// V4.15 Model signal types
+
+/** Dynamic feature key-value map (all 50 features sent from model server) */
+export type ModelFeatures = Record<string, number>;
+
+export interface ModelSignal {
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  strength: number;
+  probability: number;
+  triggered: boolean;
+  blocked_by: string[];
+  reasoning: string[];
+  circuit_breaker_active: boolean;
+  entry_threshold: number;
+  exit_threshold: number;
+}
+
+export interface PositionMeta {
+  stop_loss: number;
+  take_profit: number;
+  position_size_pct: number;
+  effective_min_hold: number;
+  bars_held: number;
+}
+
+export interface Trade {
+  direction: 'LONG' | 'SHORT';
+  entry_price: number;
+  exit_price: number;
+  entry_time: number;
+  exit_time: number;
+  pnl_pct: number;
+  pnl_dollar: number;
+  bars_held?: number;
+  position_size_pct?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  entry_probability?: number;
+  entry_strength?: number;
+  reason: string;
+}
+
+export interface PortfolioState {
+  balance: number;
+  starting_balance: number;
+  total_pnl: number;
+  total_pnl_pct: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  position: 'LONG' | 'SHORT' | null;
+  entry_price: number;
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  recent_trades: Trade[];
+}
+
+export interface DataQuality {
+  btc_candles: number;
+  eth_candles: number;
+  ready: boolean;
+  min_required: number;
+  last_btc_time: number;
+  last_eth_time: number;
+  synced: boolean;
+}
+
+export interface ModelInfo {
+  version: string;
+  n_features: number;
+  calc_time_ms: number;
+}
+
+export interface ModelSignalData {
+  timestamp: string;
+  ratio: number;
+  btc_price: number;
+  eth_price: number;
+  features: ModelFeatures;
+  signal: ModelSignal;
+  position_meta?: PositionMeta;
+  portfolio: PortfolioState;
+  data_quality: DataQuality;
+  model_info: ModelInfo;
+}

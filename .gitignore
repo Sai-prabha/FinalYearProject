@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+stream*.log
+*.log.*
+
+# Data (keep structure, ignore contents)
+data/binance_spot/*.csv
+data/binance_spot/*.backup.csv
+data/legacy_v4/binance_spot/*.csv
+data/legacy_v4/binance_spot/*.backup.csv
+data/live/*/*.parquet
+data/live/*/
+data/live/*.json
+data/live/*.csv
+data/live_fdusd/*/*.parquet
+data/processed/
+data/processed_v5/
+data/legacy_v4/
+
+# Keep directory structure
+!data/binance_spot/.gitkeep
+!data/legacy_v4/binance_spot/.gitkeep
+!data/live/.gitkeep
+!data/processed/.gitkeep
+!data/processed_v5/.gitkeep
+
+# Reports (keep examples, ignore bulk)
+reports/v4*/
+reports/v5*/
+!reports/v4.1_original_unprofitable/
+!reports/.gitkeep
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+notebooks/*.ipynb
+!notebooks/example.ipynb
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+restart_log.txt
+
+# Deployment / runtime
+.model_server.pid
+.cursor/
+
+

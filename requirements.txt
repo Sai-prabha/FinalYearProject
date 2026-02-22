@@ -1,0 +1,18 @@
+# API Server Dependencies
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# Data Processing & Analysis
+aiohttp
+websockets>=12.0
+pandas>=2.0.0
+pyarrow
+numpy>=1.24.0
+requests
+matplotlib
+xgboost
+scikit-learn
+shap
+python-dateutil
+tabulate
+tensorflow>=2.13.0
