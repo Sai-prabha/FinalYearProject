@@ -20,20 +20,32 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 from contextlib import asynccontextmanager
 
+import bcrypt
 import numpy as np
 import requests
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
 from xgboost import XGBClassifier
 
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .version_config import get_strategy_config, list_versions
+
+# ── Auth config (optional; set AUTH_REQUIRED=true on Railway for production) ──
+AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"
+ADMIN_USERNAME = "adm1nFYP"
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+SUBSCRIBER_API_KEY = os.environ.get("SUBSCRIBER_API_KEY", "")
 
 
 # ── Numpy → native Python converter ───────────────────────────────────────
@@ -453,6 +465,60 @@ async def lifespan(app: FastAPI):
         pass
 
 
+# ── Auth helpers ────────────────────────────────────────────────────────────
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    """Verify password against bcrypt hash."""
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _create_jwt(username: str) -> str:
+    """Create JWT token for authenticated user."""
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    return jwt.encode(
+        {"sub": username, "exp": expire},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def _verify_jwt(token: str) -> Optional[str]:
+    """Verify JWT and return username, or None if invalid."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+def _get_token_from_request(authorization: Optional[str] = None) -> Optional[str]:
+    """Extract Bearer token from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    return authorization[7:].strip()
+
+
+def _require_auth_or_skip(authorization: Optional[str] = None):
+    """If AUTH_REQUIRED, validate JWT. Otherwise allow."""
+    if not AUTH_REQUIRED:
+        return
+    token = _get_token_from_request(authorization)
+    if not token or not _verify_jwt(token):
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def _verify_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = None):
+    """Verify subscriber API key for /api/predict."""
+    key = api_key or x_api_key
+    if not SUBSCRIBER_API_KEY or key != SUBSCRIBER_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -464,11 +530,22 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://app.pairpredictions.com",
+        "https://pairpredictions.com",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 @app.get("/")
@@ -479,6 +556,54 @@ async def root():
         "version": MODEL_VERSION,
         "model": "XGBClassifier",
     }
+
+
+@app.post("/api/login")
+async def api_login(req: LoginRequest):
+    """Authenticate user and return JWT. Credentials: adm1nFYP / FYP2026!"""
+    if not AUTH_REQUIRED:
+        return {"token": _create_jwt(ADMIN_USERNAME), "user": ADMIN_USERNAME}
+    if not ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=503, detail="Auth not configured")
+    if req.username != ADMIN_USERNAME or not _verify_password(req.password, ADMIN_PASSWORD_HASH):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"token": _create_jwt(req.username), "user": req.username}
+
+
+@app.get("/api/me")
+async def api_me(authorization: Optional[str] = Header(None)):
+    """Validate JWT and return user info."""
+    if not AUTH_REQUIRED:
+        return {"user": ADMIN_USERNAME, "authenticated": True}
+    token = _get_token_from_request(authorization)
+    username = _verify_jwt(token) if token else None
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+    return {"user": username, "authenticated": True}
+
+
+@app.post("/api/logout")
+async def api_logout():
+    """Logout (client should discard token)."""
+    return {"status": "ok"}
+
+
+@app.get("/api/predict")
+async def api_predict(
+    request: Request,
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """Return latest prediction. Auth: X-API-Key header or ?api_key= query param."""
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        key = auth_header[7:].strip()
+    else:
+        key = api_key or x_api_key
+    _verify_api_key(api_key=key, x_api_key=key)
+    if not latest_signal_data.get("timestamp"):
+        raise HTTPException(status_code=503, detail="No prediction available yet")
+    return _sanitize_for_json(latest_signal_data)
 
 
 @app.get("/version")
@@ -503,8 +628,9 @@ async def status():
 
 
 @app.get("/trades")
-async def get_trades():
+async def get_trades(authorization: Optional[str] = Header(None)):
     """Return persisted trade history from JSON file."""
+    _require_auth_or_skip(authorization)
     if TRADE_HISTORY_JSON.exists():
         try:
             with open(TRADE_HISTORY_JSON, "r") as f:
@@ -516,8 +642,9 @@ async def get_trades():
 
 
 @app.delete("/trades/clear")
-async def clear_trades():
+async def clear_trades(authorization: Optional[str] = Header(None)):
     """Clear all persisted trade history and reset signal generator state."""
+    _require_auth_or_skip(authorization)
     global _last_trade_count, latest_signal_data
 
     # Clear JSON file
@@ -555,8 +682,9 @@ async def clear_trades():
 
 
 @app.get("/features/importance")
-async def features_importance():
+async def features_importance(authorization: Optional[str] = Header(None)):
     """Return all 50 feature names with their XGBoost importance scores."""
+    _require_auth_or_skip(authorization)
     if model is None or not feature_names:
         return {"features": [], "error": "Model not loaded"}
 
@@ -590,6 +718,14 @@ async def features_importance():
 @app.websocket("/ws/signals")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for streaming trading signals to frontend."""
+    # Validate JWT from query param when AUTH_REQUIRED
+    if AUTH_REQUIRED:
+        token = websocket.scope.get("query_string", b"").decode()
+        params = dict(p.split("=", 1) for p in token.split("&") if "=" in p)
+        jwt_token = params.get("token", "")
+        if not jwt_token or not _verify_jwt(jwt_token):
+            await websocket.close(code=4001)
+            return
     await websocket.accept()
     active_connections.add(websocket)
 

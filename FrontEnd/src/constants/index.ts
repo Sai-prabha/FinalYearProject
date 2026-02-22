@@ -7,9 +7,12 @@ export const WS_URLS = {
 // Backward compat alias
 export const BINANCE_WS_URLS = WS_URLS;
 
-// Model server URL
-export const MODEL_SERVER_URL = 'ws://localhost:8888/ws/signals';
-export const MODEL_SERVER_REST_URL = 'http://localhost:8888';
+// Model server URL (use env vars in production)
+export const MODEL_SERVER_URL = import.meta.env.VITE_MODEL_SERVER_URL || 'ws://localhost:8888/ws/signals';
+export const MODEL_SERVER_REST_URL = import.meta.env.VITE_MODEL_SERVER_REST_URL || 'http://localhost:8888';
+
+// When true, frontend requires login (production)
+export const AUTH_REQUIRED = (import.meta.env.VITE_MODEL_SERVER_REST_URL?.startsWith('https://') ?? false);
 
 // API symbols
 export const API_SYMBOLS = {

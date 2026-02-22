@@ -11,7 +11,8 @@ import { RatioOrderBook } from './RatioOrderBook';
 import { ConnectionStatus } from './ConnectionStatus';
 import { ModelThinking } from './ModelThinking';
 import { TradeHistory } from './TradeHistory';
-import { THEME_COLORS, API_SYMBOLS } from '../constants';
+import { AUTH_REQUIRED, THEME_COLORS, API_SYMBOLS } from '../constants';
+import { useAuth } from '../context/AuthContext';
 import type { CandleData, Trade } from '../types';
 import type { Timeframe } from './TimeframeSelector';
 
@@ -26,6 +27,7 @@ export const Dashboard: React.FC = () => {
   
   // Connect to model server
   const { signalData, connectionStatus: modelConnectionStatus } = useModelSignals();
+  const { logout } = useAuth();
 
   // 24h stats from REST API (accurate)
   const { btcStats, ethStats, ratioStats } = use24hStats();
@@ -252,6 +254,18 @@ export const Dashboard: React.FC = () => {
             >
               {showModelPanel ? 'Hide' : 'Show'} Model
             </button>
+            {AUTH_REQUIRED && (
+              <button
+                onClick={logout}
+                className="px-3 py-1 text-xs rounded transition-colors"
+                style={{
+                  backgroundColor: THEME_COLORS.CARD_BG_LIGHT,
+                  color: THEME_COLORS.TEXT_SECONDARY
+                }}
+              >
+                Logout
+              </button>
+            )}
           </div>
         </div>
       </header>

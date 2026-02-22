@@ -19,6 +19,8 @@
  * instead of naively summing raw price-change percentages.
  */
 import type { Trade, ModelSignalData } from '../types';
+import { MODEL_SERVER_REST_URL } from '../constants';
+import { getAuthHeaders } from './auth';
 
 /* ------------------------------------------------------------------ */
 /*  Type alias for ExcelJS worksheet (used across helpers)             */
@@ -1294,7 +1296,7 @@ async function buildTopFeaturesSheet(
 
   let importanceMap: Record<string, number> = {};
   try {
-    const resp = await fetch('http://localhost:8888/features/importance');
+    const resp = await fetch(`${MODEL_SERVER_REST_URL}/features/importance`, { headers: getAuthHeaders() });
     if (resp.ok) {
       const data = await resp.json();
       if (data.features) {

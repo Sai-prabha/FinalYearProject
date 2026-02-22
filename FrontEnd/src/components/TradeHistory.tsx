@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { THEME_COLORS, MODEL_SERVER_REST_URL } from '../constants';
 import type { PortfolioState, Trade, ModelSignalData } from '../types';
+import { getAuthHeaders } from '../utils/auth';
 import { exportTradesToExcel, exportTradesToCSV } from '../utils/excelExport';
 
 const STORAGE_KEY = 'trade_history';
@@ -38,7 +39,7 @@ export const TradeHistory: React.FC<TradeHistoryProps> = ({
 
     const syncFromBackend = async () => {
       try {
-        const resp = await fetch(`${MODEL_SERVER_REST_URL}/trades`);
+        const resp = await fetch(`${MODEL_SERVER_REST_URL}/trades`, { headers: getAuthHeaders() });
         if (resp.ok) {
           const data = await resp.json();
           const trades: Trade[] = data.trades || [];
@@ -145,7 +146,7 @@ export const TradeHistory: React.FC<TradeHistoryProps> = ({
 
       // Also clear backend trade history so trades don't reappear on refresh
       try {
-        await fetch(`${MODEL_SERVER_REST_URL}/trades/clear`, { method: 'DELETE' });
+        await fetch(`${MODEL_SERVER_REST_URL}/trades/clear`, { method: 'DELETE', headers: getAuthHeaders() });
       } catch {
         // Backend may be offline — local clear still succeeded
       }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { MODEL_SERVER_URL, CONFIG } from '../constants';
+import { AUTH_REQUIRED, MODEL_SERVER_URL, CONFIG } from '../constants';
+import { getAuthToken } from '../utils/auth';
 import type { ModelSignalData, ConnectionStatus } from '../types';
 
 interface UseModelSignalsReturn {
@@ -30,7 +31,15 @@ export const useModelSignals = (): UseModelSignalsReturn => {
       setConnectionStatus('connecting');
       setError(null);
 
-      const ws = new WebSocket(MODEL_SERVER_URL);
+      let wsUrl = MODEL_SERVER_URL;
+      if (AUTH_REQUIRED) {
+        const token = getAuthToken();
+        if (token) {
+          const sep = wsUrl.includes('?') ? '&' : '?';
+          wsUrl = `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+        }
+      }
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
