@@ -37,6 +37,18 @@ from xgboost import XGBClassifier
 
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .version_config import get_strategy_config, list_versions
+from .broker_client import (
+    BrokerClient,
+    OrderRequest,
+    OrderResponse,
+    make_broker_client,
+)
+from .broker_config import (
+    BrokerConfig,
+    apply_partial_update,
+    load_broker_config,
+    save_broker_config,
+)
 
 # ── Auth config (optional; set AUTH_REQUIRED=true on Railway for production) ──
 AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"
@@ -106,6 +118,12 @@ active_connections: Set[WebSocket] = set()
 # Track last known trade count for persistence
 _last_trade_count: int = 0
 
+# Broker integration state
+broker_client: Optional[BrokerClient] = None
+broker_config: Optional[BrokerConfig] = None
+# Independent counter so a broker outage cannot block local trade persistence
+_last_broker_count: int = 0
+
 latest_signal_data: Dict = {
     "timestamp": None,
     "ratio": None,
@@ -167,6 +185,52 @@ def _check_and_persist_new_trades():
         for trade in signal_gen.trades[_last_trade_count:]:
             _persist_trade(trade)
         _last_trade_count = current_count
+
+
+async def _forward_new_trades_to_broker():
+    """Forward simulator-produced trades to the configured broker.
+
+    Walks ``signal_gen.trades[_last_broker_count:]`` and, for each new trade,
+    issues a single MARKET order in the trade's direction (BUY for LONG,
+    SELL for SHORT). ``_last_broker_count`` advances regardless of the broker
+    response so a transient outage does not cause us to retry forever.
+
+    Note: each trade record is a *round-trip* (entry + exit). For v1 we send
+    one market order per trade in the trade's direction; reconciliation with
+    real fills is listed as a follow-up.
+    """
+    global _last_broker_count
+    if signal_gen is None or broker_client is None or broker_config is None:
+        return
+
+    current_count = len(signal_gen.trades)
+    if current_count <= _last_broker_count:
+        return
+
+    for trade in signal_gen.trades[_last_broker_count:]:
+        direction = str(trade.get("direction", "")).upper()
+        if direction not in ("LONG", "SHORT"):
+            continue
+        side = "BUY" if direction == "LONG" else "SELL"
+        entry_time = trade.get("entry_time", "")
+        client_id = f"v415-{entry_time}-{direction}"[:36]
+        req = OrderRequest(
+            symbol=broker_config.default_symbol,
+            side=side,
+            order_type="MARKET",
+            quantity=broker_config.default_qty,
+            client_id=client_id,
+        )
+        try:
+            resp = await asyncio.to_thread(broker_client.place_order, req)
+            if resp.status == "REJECTED":
+                logger.warning(f"Broker rejected auto-trade {client_id}: {resp.message}")
+            else:
+                logger.info(f"Broker auto-trade {client_id} → {resp.status} id={resp.broker_order_id}")
+        except Exception as e:
+            logger.error(f"Broker auto-trade {client_id} raised: {e}", exc_info=True)
+
+    _last_broker_count = current_count
 
 
 # ── REST warm-up ─────────────────────────────────────────────────────────
@@ -288,6 +352,15 @@ async def process_kline_message(data: Dict):
     # Persist new trades to disk
     _check_and_persist_new_trades()
 
+    # Auto-forward to broker only when explicitly enabled in demo mode
+    if (
+        broker_client is not None
+        and broker_config is not None
+        and broker_client.mode == "demo"
+        and broker_config.auto_execute
+    ):
+        await _forward_new_trades_to_broker()
+
     # Build ALL features for frontend display & export (all 50)
     feature_values = {}
     for col in feature_names:
@@ -318,6 +391,7 @@ async def process_kline_message(data: Dict):
             "version": MODEL_VERSION,
             "n_features": len(feature_names),
             "calc_time_ms": round(calc_ms, 1),
+            "broker": _broker_summary(),
         },
     }
 
@@ -425,6 +499,18 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"  Trade history: {TRADE_HISTORY_JSON}")
 
+    # 2.5. Broker integration — runtime config + (Binance Testnet | paper) client
+    global broker_client, broker_config, _last_broker_count
+    broker_config = load_broker_config()
+    broker_client = make_broker_client()
+    _last_broker_count = len(signal_gen.trades) if signal_gen else 0
+    logger.info(
+        f"  Broker: mode={broker_client.mode} "
+        f"auto_execute={broker_config.auto_execute} "
+        f"symbol={broker_config.default_symbol} "
+        f"qty={broker_config.default_qty}"
+    )
+
     # 3. Warm up with historical candles
     logger.info(f"Warming up with {WARMUP_CANDLES} historical candles...")
     try:
@@ -517,6 +603,19 @@ def _verify_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = No
     key = api_key or x_api_key
     if not SUBSCRIBER_API_KEY or key != SUBSCRIBER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ── Broker helpers ─────────────────────────────────────────────────────────
+
+
+def _broker_summary() -> Dict:
+    """Compact broker snapshot exposed in /status and WS payloads."""
+    return {
+        "mode": broker_client.mode if broker_client is not None else "unknown",
+        "auto_execute": broker_config.auto_execute if broker_config is not None else False,
+        "default_symbol": broker_config.default_symbol if broker_config is not None else "BTCUSDT",
+        "default_qty": broker_config.default_qty if broker_config is not None else 0.001,
+    }
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────
@@ -624,6 +723,7 @@ async def status():
         "active_clients": len(active_connections),
         "model_version": MODEL_VERSION,
         "n_features": len(feature_names),
+        "broker": _broker_summary(),
     }
 
 
@@ -713,6 +813,104 @@ async def features_importance(authorization: Optional[str] = Header(None)):
     except Exception as e:
         logger.error(f"Error getting feature importance: {e}", exc_info=True)
         return {"features": [], "error": str(e)}
+
+
+# ── Broker control ────────────────────────────────────────────────────────
+
+
+class BrokerConfigUpdate(BaseModel):
+    """Partial update payload for POST /broker/config."""
+
+    auto_execute: Optional[bool] = None
+    default_symbol: Optional[str] = None
+    default_qty: Optional[float] = None
+
+
+def _broker_or_503() -> BrokerClient:
+    if broker_client is None:
+        raise HTTPException(status_code=503, detail="Broker not initialized")
+    return broker_client
+
+
+@app.get("/broker/config")
+async def get_broker_config(authorization: Optional[str] = Header(None)):
+    """Return the current runtime broker config + mode."""
+    _require_auth_or_skip(authorization)
+    return _broker_summary()
+
+
+@app.post("/broker/config")
+async def update_broker_config_route(
+    update: BrokerConfigUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    """Update auto_execute / default_symbol / default_qty at runtime."""
+    _require_auth_or_skip(authorization)
+    global broker_config
+    if broker_config is None:
+        raise HTTPException(status_code=503, detail="Broker config not initialized")
+
+    try:
+        new_cfg = apply_partial_update(broker_config, update.model_dump(exclude_none=True))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid broker config: {e}")
+
+    save_broker_config(new_cfg)
+    broker_config = new_cfg
+    logger.info(f"Broker config updated: {new_cfg.model_dump()}")
+    return _broker_summary()
+
+
+@app.get("/broker/balance")
+async def get_broker_balance(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    balance = await asyncio.to_thread(bc.get_balance)
+    return {"mode": bc.mode, **balance}
+
+
+@app.get("/broker/positions")
+async def get_broker_positions(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    positions = await asyncio.to_thread(bc.get_open_positions)
+    return {"mode": bc.mode, "positions": positions}
+
+
+@app.post("/trade")
+async def post_trade(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Place a real order through the configured broker (demo or paper)."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_order, req)
+    return resp.model_dump()
+
+
+@app.post("/trade/test")
+async def post_trade_test(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Send the order through Binance's test endpoint (no real fill)."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_test_order, req)
+    return resp.model_dump()
+
+
+@app.delete("/broker/order/{order_id}")
+async def delete_broker_order(
+    order_id: str,
+    symbol: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    ok = await asyncio.to_thread(bc.cancel_order, order_id, symbol)
+    return {"ok": ok, "order_id": order_id, "symbol": symbol}
 
 
 @app.websocket("/ws/signals")

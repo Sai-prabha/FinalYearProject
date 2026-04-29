@@ -121,10 +121,62 @@ export interface DataQuality {
   synced: boolean;
 }
 
+export interface BrokerConfigSummary {
+  mode: 'paper' | 'demo' | 'unknown';
+  auto_execute: boolean;
+  default_symbol: string;
+  default_qty: number;
+}
+
+export interface BrokerBalanceAsset {
+  asset: string;
+  balance: number;
+  available: number;
+}
+
+export interface BrokerBalanceResponse {
+  mode: string;
+  assets: BrokerBalanceAsset[];
+}
+
+export interface BrokerPosition {
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  size: number;
+  entry_price: number;
+  mark_price: number;
+  unrealized_pnl: number;
+  leverage: number;
+}
+
+export interface BrokerPositionsResponse {
+  mode: string;
+  positions: BrokerPosition[];
+}
+
+export interface OrderRequestPayload {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  order_type?: 'MARKET' | 'LIMIT';
+  quantity: number;
+  price?: number;
+  reduce_only?: boolean;
+  client_id?: string;
+}
+
+export interface OrderResponsePayload {
+  broker_order_id: string;
+  status: string;
+  filled_qty: number;
+  avg_price: number;
+  message?: string | null;
+}
+
 export interface ModelInfo {
   version: string;
   n_features: number;
   calc_time_ms: number;
+  broker?: BrokerConfigSummary;
 }
 
 export interface ModelSignalData {

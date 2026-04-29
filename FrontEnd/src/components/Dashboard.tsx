@@ -11,6 +11,7 @@ import { RatioOrderBook } from './RatioOrderBook';
 import { ConnectionStatus } from './ConnectionStatus';
 import { ModelThinking } from './ModelThinking';
 import { TradeHistory } from './TradeHistory';
+import { BrokerPanel } from './BrokerPanel';
 import { AUTH_REQUIRED, THEME_COLORS, API_SYMBOLS } from '../constants';
 import { useAuth } from '../context/AuthContext';
 import type { CandleData, Trade } from '../types';
@@ -24,6 +25,7 @@ export const Dashboard: React.FC = () => {
   const [timeframe, setTimeframe] = useState<Timeframe>('1m');
   const [maVisibility, setMAVisibility] = useState({ ma7: true, ma25: true, ma99: true });
   const [showModelPanel, setShowModelPanel] = useState<boolean>(true);
+  const [showBrokerPanel, setShowBrokerPanel] = useState<boolean>(false);
   
   // Connect to model server
   const { signalData, connectionStatus: modelConnectionStatus } = useModelSignals();
@@ -254,6 +256,16 @@ export const Dashboard: React.FC = () => {
             >
               {showModelPanel ? 'Hide' : 'Show'} Model
             </button>
+            <button
+              onClick={() => setShowBrokerPanel(!showBrokerPanel)}
+              className="px-3 py-1 text-xs rounded transition-colors"
+              style={{
+                backgroundColor: showBrokerPanel ? THEME_COLORS.YELLOW : THEME_COLORS.CARD_BG_LIGHT,
+                color: showBrokerPanel ? THEME_COLORS.BACKGROUND : THEME_COLORS.TEXT_SECONDARY
+              }}
+            >
+              {showBrokerPanel ? 'Hide' : 'Show'} Broker
+            </button>
             {AUTH_REQUIRED && (
               <button
                 onClick={logout}
@@ -312,6 +324,13 @@ export const Dashboard: React.FC = () => {
                 btcPrice={btc.currentPrice}
                 ethPrice={eth.currentPrice}
               />
+            </div>
+          )}
+
+          {/* Broker Control Panel */}
+          {showBrokerPanel && (
+            <div className="flex-shrink-0 h-full" style={{ width: '280px' }}>
+              <BrokerPanel signalData={signalData} />
             </div>
           )}
 
