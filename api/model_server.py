@@ -37,6 +37,18 @@ from xgboost import XGBClassifier
 
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .version_config import get_strategy_config, list_versions
+from .broker_client import (
+    BrokerClient,
+    OrderRequest,
+    OrderResponse,
+    make_broker_client,
+)
+from .broker_config import (
+    BrokerConfig,
+    apply_partial_update,
+    load_broker_config,
+    save_broker_config,
+)
 
 # ── Auth config (optional; set AUTH_REQUIRED=true on Railway for production) ──
 AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"
@@ -106,6 +118,15 @@ active_connections: Set[WebSocket] = set()
 # Track last known trade count for persistence
 _last_trade_count: int = 0
 
+# Broker integration state
+broker_client: Optional[BrokerClient] = None
+broker_config: Optional[BrokerConfig] = None
+# Last position the broker has been instructed to hold (-1, 0, +1).
+# Updated after every attempt so transient outages don't cause order storms.
+_broker_position: int = 0
+# Most recent auto-execute event — included in every WS broadcast after it fires.
+_last_execution_event: Optional[Dict] = None
+
 latest_signal_data: Dict = {
     "timestamp": None,
     "ratio": None,
@@ -167,6 +188,191 @@ def _check_and_persist_new_trades():
         for trade in signal_gen.trades[_last_trade_count:]:
             _persist_trade(trade)
         _last_trade_count = current_count
+
+
+async def _place_leg_order(
+    symbol: str,
+    side: str,
+    qty: float,
+    reduce_only: bool,
+    tag: str,
+) -> dict:
+    """Place a single MARKET order for one leg of a ratio trade.
+
+    Returns a result dict with keys: symbol, side, qty, reduce_only, status,
+    order_id, filled_qty, avg_price, error.  Never raises.
+    """
+    client_id = f"v415-{tag}-{symbol[:3]}"[:36]
+    req = OrderRequest(
+        symbol=symbol,
+        side=side,
+        order_type="MARKET",
+        quantity=qty,
+        reduce_only=reduce_only,
+        client_id=client_id,
+    )
+    base = {"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only}
+    try:
+        resp = await asyncio.to_thread(broker_client.place_order, req)
+        if resp.status == "REJECTED":
+            logger.warning(
+                f"Broker leg REJECTED {symbol} {side} qty={qty} reduce={reduce_only}: {resp.message}"
+            )
+            return {**base, "status": "REJECTED", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0, "error": resp.message}
+        logger.info(
+            f"Broker leg {symbol} {side} qty={qty} reduce={reduce_only} "
+            f"→ {resp.status} id={resp.broker_order_id} filled={resp.filled_qty} avg={resp.avg_price}"
+        )
+        return {**base, "status": resp.status, "order_id": resp.broker_order_id, "filled_qty": resp.filled_qty, "avg_price": resp.avg_price, "error": None}
+    except Exception as e:
+        logger.error(f"Broker leg {symbol} {side} raised: {e}", exc_info=True)
+        return {**base, "status": "ERROR", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0, "error": str(e)}
+
+
+async def _place_entry_orders(direction: int, timestamp: int) -> list:
+    """Place dual-leg MARKET entry orders for a new ratio position.
+
+    LONG  ratio (BTC/ETH up)  → BUY  BTCUSDT + SELL ETHUSDT
+    SHORT ratio (BTC/ETH down) → SELL BTCUSDT + BUY  ETHUSDT
+    Returns list of per-leg result dicts.
+    """
+    btc_side = "BUY" if direction == 1 else "SELL"
+    eth_side = "SELL" if direction == 1 else "BUY"
+    label = "L" if direction == 1 else "S"
+    tag = f"{timestamp}-{label}"
+
+    btc = await _place_leg_order("BTCUSDT", btc_side, broker_config.default_btc_qty, False, tag)
+    eth = await _place_leg_order("ETHUSDT", eth_side, broker_config.default_eth_qty, False, tag)
+    return [btc, eth]
+
+
+async def _place_exit_orders(direction: int, timestamp: int) -> list:
+    """Place reduce-only MARKET exit orders to close an existing ratio position.
+
+    Closes LONG  → SELL BTCUSDT + BUY  ETHUSDT (reduce_only)
+    Closes SHORT → BUY  BTCUSDT + SELL ETHUSDT (reduce_only)
+    Returns list of per-leg result dicts.
+    """
+    btc_side = "SELL" if direction == 1 else "BUY"
+    eth_side = "BUY" if direction == 1 else "SELL"
+    label = "XL" if direction == 1 else "XS"
+    tag = f"{timestamp}-{label}"
+
+    btc = await _place_leg_order("BTCUSDT", btc_side, broker_config.default_btc_qty, True, tag)
+    eth = await _place_leg_order("ETHUSDT", eth_side, broker_config.default_eth_qty, True, tag)
+    return [btc, eth]
+
+
+_TERMINAL_STATUSES = {"FILLED", "REJECTED", "ERROR", "CANCELED", "EXPIRED"}
+
+
+async def _reconcile_legs(legs: list) -> None:
+    """Poll Binance concurrently for confirmed fill data on all submitted legs.
+
+    Each leg is polled independently with back-off: 0.5 s, 1.5 s, 3.5 s cumulative.
+    Legs without an order_id or already in a terminal state are skipped.
+    Paper broker returns None from get_order_status and is also skipped.
+    Total worst-case wall time ≈ 3.5 s regardless of how many legs there are.
+    """
+    POLL_DELAYS = [0.5, 1.0, 2.0]  # gaps between polls; cumulative max ≈ 3.5 s
+
+    async def _poll_one(leg: dict) -> None:
+        order_id = leg.get("order_id", "")
+        if not order_id or leg.get("status") in _TERMINAL_STATUSES:
+            return
+        for delay in POLL_DELAYS:
+            await asyncio.sleep(delay)
+            try:
+                fill = await asyncio.to_thread(
+                    broker_client.get_order_status, leg["symbol"], order_id
+                )
+            except Exception as e:
+                logger.warning(f"Reconcile poll error {leg['symbol']} #{order_id}: {e}")
+                return
+            if fill is None:
+                return  # paper broker — no polling possible
+            leg["status"] = fill["status"]
+            leg["filled_qty"] = fill["filled_qty"]
+            leg["avg_price"] = fill["avg_price"]
+            leg["reconciled"] = True
+            if fill["status"] in _TERMINAL_STATUSES:
+                logger.info(
+                    f"Reconciled {leg['symbol']} #{order_id}: "
+                    f"{fill['status']} qty={fill['filled_qty']} avg={fill['avg_price']:.2f}"
+                )
+                return
+
+    await asyncio.gather(*(_poll_one(leg) for leg in legs))
+
+
+async def _reconcile_and_broadcast() -> None:
+    """Background task: reconcile leg fills then push an exec_reconciled WS event."""
+    global _last_execution_event
+    if _last_execution_event is None:
+        return
+    legs = _last_execution_event.get("legs", [])
+    await _reconcile_legs(legs)
+    # Recompute all_ok with final statuses
+    _last_execution_event["all_ok"] = all(
+        leg["status"] not in ("REJECTED", "ERROR", "CANCELED", "EXPIRED")
+        for leg in legs
+    )
+    _last_execution_event["reconciled"] = True
+    # Broadcast a lightweight message so the frontend doesn't wait for the next candle
+    await broadcast_to_clients({
+        "type": "exec_reconciled",
+        "last_exec": _last_execution_event,
+    })
+    logger.info(
+        "Reconciliation broadcast: %d legs, all_ok=%s",
+        len(legs),
+        _last_execution_event["all_ok"],
+    )
+
+
+async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp: int) -> None:
+    """Execute broker orders for a model position transition and advance _broker_position.
+
+    Handles three cases:
+      0 → ±1 : entry orders for both legs
+      ±1 → 0 : reduce-only exit orders for both legs
+      ±1 → ∓1: exit old position then open new (reversal)
+
+    ``_broker_position`` is updated regardless of order outcomes so a
+    transient broker outage does not trigger an infinite order loop.
+    Results are stored in ``_last_execution_event`` and a background reconciliation
+    task enriches fill data (filled_qty, avg_price) then re-broadcasts to WS clients.
+    """
+    global _broker_position, _last_execution_event
+
+    legs: list = []
+    if prev_pos != 0:
+        legs.extend(await _place_exit_orders(prev_pos, timestamp))
+
+    if new_pos != 0:
+        legs.extend(await _place_entry_orders(new_pos, timestamp))
+
+    _broker_position = new_pos
+
+    pos_label = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
+    all_ok = all(leg["status"] not in ("REJECTED", "ERROR") for leg in legs)
+    _last_execution_event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "prev_pos": prev_pos,
+        "new_pos": new_pos,
+        "transition": f"{pos_label.get(prev_pos,'?')}→{pos_label.get(new_pos,'?')}",
+        "legs": legs,
+        "all_ok": all_ok,
+        "reconciled": False,
+    }
+    status_str = "OK" if all_ok else "PARTIAL/FAILED"
+    logger.info(
+        f"AUTO-EXEC [{status_str}] {pos_label.get(prev_pos,'?')}→{pos_label.get(new_pos,'?')} "
+        f"({len(legs)} legs): "
+        + ", ".join(f"{l['symbol']} {l['side']} {l['status']}" for l in legs)
+    )
+    # Fire reconciliation in background — updates legs and re-broadcasts within ~3.5 s
+    asyncio.create_task(_reconcile_and_broadcast())
 
 
 # ── REST warm-up ─────────────────────────────────────────────────────────
@@ -282,11 +488,39 @@ async def process_kline_message(data: Dict):
     eth_close = feature_calc.eth_candles[-1]["close"]
     current_ratio = btc_close / eth_close
 
+    # Capture pre-update model position for change detection
+    _pre_update_pos = signal_gen.position
+
     # Generate signal
     sig = signal_gen.update(proba_up, current_ratio, candle["time"])
 
     # Persist new trades to disk
     _check_and_persist_new_trades()
+
+    # Auto-execute: detect position transitions and send dual-leg broker orders
+    if (
+        broker_client is not None
+        and broker_config is not None
+        and broker_client.mode == "demo"
+        and broker_config.auto_execute
+    ):
+        _post_update_pos = signal_gen.position
+        if _post_update_pos != _broker_position:
+            await _execute_broker_position_change(
+                _broker_position, _post_update_pos, candle["time"]
+            )
+    elif (
+        broker_config is not None
+        and broker_config.auto_execute
+        and broker_client is not None
+        and broker_client.mode != "demo"
+    ):
+        # Warn once per candle so the operator knows orders are not being sent.
+        logger.warning(
+            "auto_execute=True but broker mode=%r — restart with BINANCE_ENV=demo "
+            "and credentials to send real Testnet orders",
+            broker_client.mode,
+        )
 
     # Build ALL features for frontend display & export (all 50)
     feature_values = {}
@@ -318,6 +552,8 @@ async def process_kline_message(data: Dict):
             "version": MODEL_VERSION,
             "n_features": len(feature_names),
             "calc_time_ms": round(calc_ms, 1),
+            "broker": _broker_summary(),
+            "last_exec": _last_execution_event,
         },
     }
 
@@ -425,6 +661,21 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"  Trade history: {TRADE_HISTORY_JSON}")
 
+    # 2.5. Broker integration — runtime config + (Binance Testnet | paper) client
+    global broker_client, broker_config, _broker_position
+    broker_config = load_broker_config()
+    broker_client = make_broker_client()
+    # signal_gen.position is always 0 after restore_from_trades; safe sentinel.
+    _broker_position = 0
+    logger.info(
+        f"  Broker: mode={broker_client.mode} "
+        f"auto_execute={broker_config.auto_execute} "
+        f"symbol={broker_config.default_symbol} "
+        f"qty={broker_config.default_qty} "
+        f"btc_qty={broker_config.default_btc_qty} "
+        f"eth_qty={broker_config.default_eth_qty}"
+    )
+
     # 3. Warm up with historical candles
     logger.info(f"Warming up with {WARMUP_CANDLES} historical candles...")
     try:
@@ -519,6 +770,21 @@ def _verify_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = No
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+# ── Broker helpers ─────────────────────────────────────────────────────────
+
+
+def _broker_summary() -> Dict:
+    """Compact broker snapshot exposed in /status and WS payloads."""
+    return {
+        "mode": broker_client.mode if broker_client is not None else "unknown",
+        "auto_execute": broker_config.auto_execute if broker_config is not None else False,
+        "default_symbol": broker_config.default_symbol if broker_config is not None else "BTCUSDT",
+        "default_qty": broker_config.default_qty if broker_config is not None else 0.001,
+        "default_btc_qty": broker_config.default_btc_qty if broker_config is not None else 0.001,
+        "default_eth_qty": broker_config.default_eth_qty if broker_config is not None else 0.05,
+    }
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -531,12 +797,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
         "https://app.pairpredictions.com",
         "https://pairpredictions.com",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -624,6 +888,8 @@ async def status():
         "active_clients": len(active_connections),
         "model_version": MODEL_VERSION,
         "n_features": len(feature_names),
+        "broker": _broker_summary(),
+        "last_exec": _last_execution_event,
     }
 
 
@@ -713,6 +979,128 @@ async def features_importance(authorization: Optional[str] = Header(None)):
     except Exception as e:
         logger.error(f"Error getting feature importance: {e}", exc_info=True)
         return {"features": [], "error": str(e)}
+
+
+# ── Broker control ────────────────────────────────────────────────────────
+
+
+class BrokerConfigUpdate(BaseModel):
+    """Partial update payload for POST /broker/config."""
+
+    auto_execute: Optional[bool] = None
+    default_symbol: Optional[str] = None
+    default_qty: Optional[float] = None
+    default_btc_qty: Optional[float] = None
+    default_eth_qty: Optional[float] = None
+
+
+def _broker_or_503() -> BrokerClient:
+    if broker_client is None:
+        raise HTTPException(status_code=503, detail="Broker not initialized")
+    return broker_client
+
+
+@app.get("/broker/config")
+async def get_broker_config(authorization: Optional[str] = Header(None)):
+    """Return the current runtime broker config + mode."""
+    _require_auth_or_skip(authorization)
+    return _broker_summary()
+
+
+@app.post("/broker/config")
+async def update_broker_config_route(
+    update: BrokerConfigUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    """Update auto_execute / default_symbol / default_qty at runtime."""
+    _require_auth_or_skip(authorization)
+    global broker_config
+    if broker_config is None:
+        raise HTTPException(status_code=503, detail="Broker config not initialized")
+
+    try:
+        new_cfg = apply_partial_update(broker_config, update.model_dump(exclude_none=True))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid broker config: {e}")
+
+    save_broker_config(new_cfg)
+    broker_config = new_cfg
+    logger.info(f"Broker config updated: {new_cfg.model_dump()}")
+    return _broker_summary()
+
+
+@app.get("/broker/balance")
+async def get_broker_balance(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    balance = await asyncio.to_thread(bc.get_balance)
+    return {"mode": bc.mode, **balance}
+
+
+@app.get("/broker/positions")
+async def get_broker_positions(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    positions = await asyncio.to_thread(bc.get_open_positions)
+    return {"mode": bc.mode, "positions": positions}
+
+
+@app.post("/trade")
+async def post_trade(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Place a real order through the configured broker (demo or paper).
+
+    For demo mode, polls for fill confirmation before returning so callers
+    get confirmed filled_qty and avg_price rather than the initial NEW status.
+    """
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_order, req)
+    result = resp.model_dump()
+
+    # Enrich with confirmed fill data when the broker supports status polling
+    if resp.broker_order_id and resp.status not in _TERMINAL_STATUSES:
+        for delay in [0.5, 1.0, 2.0]:
+            await asyncio.sleep(delay)
+            try:
+                fill = await asyncio.to_thread(bc.get_order_status, req.symbol, resp.broker_order_id)
+            except Exception:
+                break
+            if fill is None:
+                break  # paper broker
+            result["status"] = fill["status"]
+            result["filled_qty"] = fill["filled_qty"]
+            result["avg_price"] = fill["avg_price"]
+            if fill["status"] in _TERMINAL_STATUSES:
+                break
+
+    return result
+
+
+@app.post("/trade/test")
+async def post_trade_test(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Send the order through Binance's test endpoint (no real fill)."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_test_order, req)
+    return resp.model_dump()
+
+
+@app.delete("/broker/order/{order_id}")
+async def delete_broker_order(
+    order_id: str,
+    symbol: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    ok = await asyncio.to_thread(bc.cancel_order, order_id, symbol)
+    return {"ok": ok, "order_id": order_id, "symbol": symbol}
 
 
 @app.websocket("/ws/signals")
