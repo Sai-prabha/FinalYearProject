@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# binance-env.sh.example — copy to binance-env.sh and fill in real values
+# binance-env.sh is gitignored and must NEVER be committed.
+#
+# TESTNET (safe for development, no real funds):
+#   - Go to https://testnet.binancefuture.com
+#   - Create an account and generate API keys
+#   - Set BINANCE_ENV=demo
+#
+# LIVE (real trading, use extreme caution):
+#   - Go to https://www.binance.com/en/my/settings/api-management
+#   - Create API keys with Futures trading enabled
+#   - Set BINANCE_ENV=live
+
+export BINANCE_API_KEY='YOUR_API_KEY_HERE'
+export BINANCE_API_SECRET='YOUR_API_SECRET_HERE'
+export BINANCE_BASE_URL='https://testnet.binancefuture.com'   # or https://fapi.binance.com for live
+export BINANCE_ENV='demo'                                       # or 'live'
+
+# Usage: source binance-env.sh before running the model server
+#   source binance-env.sh && python start_model_server.py
