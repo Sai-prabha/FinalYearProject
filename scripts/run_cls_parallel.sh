@@ -1,7 +1,8 @@
 #!/bin/bash
 # Launch parallel XGBClassifier Optuna workers
 
-cd /Users/sai.p/VSCode/Workspace\(main\)/FinalYearProject
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 PYTHON="/opt/anaconda3/envs/ml_env/bin/python"
 SCRIPT="scripts/optuna_v4_12_classifier.py"

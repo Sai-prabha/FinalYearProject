@@ -108,7 +108,7 @@ if __name__ == "__main__":
         "--model-version",
         type=str,
         default=os.environ.get("MODEL_VERSION", "v4.15"),
-        choices=["v4.15", "v4.16"],
+        choices=["v4.15", "v4.16", "v4.17"],
         help="Strategy version to run (default: v4.15)",
     )
     args = parser.parse_args()

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Quick status check without long monitoring
 
-cd /Users/sai.p/VSCode/Workspace\(main\)/FinalYearProject
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 echo "Optuna Status Check - $(date '+%H:%M:%S')"
 echo "============================================"

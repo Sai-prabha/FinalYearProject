@@ -1,8 +1,9 @@
 #!/bin/bash
 # Background monitoring that logs to file (no timeout issues)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 LOG_FILE="reports/optuna_monitoring.log"
-cd /Users/sai.p/VSCode/Workspace\(main\)/FinalYearProject
 
 echo "Starting background monitoring - logging to $LOG_FILE"
 echo "Press Ctrl+C to stop"
