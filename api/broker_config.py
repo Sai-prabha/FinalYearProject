@@ -47,10 +47,10 @@ CONFIG_PATH = LIVE_DATA_DIR / "broker_config.json"
 class BrokerConfig(BaseModel):
     auto_execute: bool = False
     default_symbol: str = "BTCUSDT"
-    default_qty: float = Field(default=0.001, gt=0)
+    default_qty: float = Field(default=0.001, gt=0, le=100.0)
     # Per-leg sizes used by the dual-leg auto-execute path
-    default_btc_qty: float = Field(default=0.001, gt=0)
-    default_eth_qty: float = Field(default=0.05, gt=0)
+    default_btc_qty: float = Field(default=0.001, gt=0, le=1.0)
+    default_eth_qty: float = Field(default=0.05, gt=0, le=20.0)
 
 
 def _defaults_from_env() -> BrokerConfig:

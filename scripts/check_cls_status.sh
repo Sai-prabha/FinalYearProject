@@ -1,7 +1,8 @@
 #!/bin/bash
 # Quick status check for classifier Optuna workers
 
-cd /Users/sai.p/VSCode/Workspace\(main\)/FinalYearProject
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 DB="reports/optuna_v4_12_cls.db"
 
 echo "========================================================================"

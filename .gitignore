@@ -47,6 +47,7 @@ data/legacy_v4/binance_spot/*.backup.csv
 data/live/*/*.parquet
 data/live/*/
 data/live/*.json
+data/live/*.jsonl
 data/live/*.csv
 data/live_fdusd/*/*.parquet
 data/processed/

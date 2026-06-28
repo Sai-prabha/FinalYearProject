@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,7 +55,13 @@ from .broker_config import (
 AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"
 ADMIN_USERNAME = "adm1nFYP"
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
+_jwt_secret_env = os.environ.get("JWT_SECRET", "")
+if not _jwt_secret_env and AUTH_REQUIRED:
+    raise RuntimeError(
+        "JWT_SECRET environment variable must be set when AUTH_REQUIRED=true. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+JWT_SECRET = _jwt_secret_env or secrets.token_hex(32)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 SUBSCRIBER_API_KEY = os.environ.get("SUBSCRIBER_API_KEY", "")
@@ -621,12 +628,11 @@ async def lifespan(app: FastAPI):
         max_history=1500,
     )
 
-    if version == "v4.16":
-        strategy_cfg = get_strategy_config("v4.16")
+    if version in ("v4.16", "v4.17"):
+        strategy_cfg = get_strategy_config(version)
         signal_gen = V416SignalGenerator(cfg=strategy_cfg)
-        logger.info(f"  Signal generator: V416SignalGenerator (asymmetric TP/SL, Kelly sizing)")
-    else:
-        # v4.15 (default) — use V414SignalGenerator with production config
+        logger.info(f"  Signal generator: V416SignalGenerator ({version} config)")
+    elif version == "v4.15":
         strategy = config["strategy_params"]
         signal_gen = V414SignalGenerator(
             entry_threshold=strategy["entry_threshold"],
@@ -637,6 +643,11 @@ async def lifespan(app: FastAPI):
             cb_threshold=strategy["cb_threshold"],
         )
         logger.info(f"  Signal generator: V414SignalGenerator (v4.15 baseline)")
+    else:
+        raise RuntimeError(
+            f"Unsupported MODEL_VERSION: {version!r}. "
+            f"Set MODEL_VERSION to one of: {list_versions()}"
+        )
 
     # Ensure trade persistence directory exists
     _ensure_live_dir()
@@ -824,7 +835,7 @@ async def root():
 
 @app.post("/api/login")
 async def api_login(req: LoginRequest):
-    """Authenticate user and return JWT. Credentials: adm1nFYP / FYP2026!"""
+    """Authenticate user and return JWT."""
     if not AUTH_REQUIRED:
         return {"token": _create_jwt(ADMIN_USERNAME), "user": ADMIN_USERNAME}
     if not ADMIN_PASSWORD_HASH:
