@@ -207,11 +207,81 @@ V416_CONFIG = StrategyConfig(
 )
 
 
+# ── V4.17 configuration (candidate — backtest before promoting to live) ───
+# Hypothesis: signal-change exits are the primary value leak.
+# 56% of live v4.16 trades exit via signal-change at avg +0.070% when TP
+# would pay +0.425%. Two targeted changes let trades develop further:
+#   1. min_hold 25 → 40 bars  (delays signal-exit window by 15 bars)
+#   2. exit_threshold 0.51 → 0.505  (requires a deeper proba drop to exit)
+# Everything else is identical to v4.16 so the comparison is clean.
+#
+# DO NOT PROMOTE without a favourable backtest vs v4.16 baseline.
+
+V417_CONFIG = StrategyConfig(
+    # Signal thresholds — SAME as v4.16
+    entry_threshold=0.525,
+    exit_threshold=0.505,        # v4.16: 0.51  — requires deeper proba drop to exit
+    min_hold=40,                 # v4.16: 25    — 15 extra bars before signal-exit allowed
+    cooldown=15,
+
+    # Circuit breaker — unchanged
+    cb_lookback=500,
+    cb_threshold=-0.03,
+
+    # SL/TP — identical to v4.16
+    tp_sl_mode="asymmetric",
+    default_stop_loss_pct=-0.20,
+    default_take_profit_pct=0.35,
+    sl_vol_mult=1.5,
+    tp_vol_mult=2.3,
+    sl_strength_scale=0.3,
+    tp_strength_scale=-0.05,
+
+    # Position sizing — identical to v4.16
+    position_sizing_mode="vol_scaled_kelly",
+    target_win_frac=0.005,
+    min_leverage=0.45,
+    max_leverage=2.5,
+    max_risk_per_trade=0.008,
+
+    # Trailing stop — identical to v4.16
+    trailing_breakeven_frac=0.42,
+    trailing_lock_frac=0.65,
+    trailing_lock_ratio=0.55,
+
+    # Dynamic min-hold floor — unchanged
+    absolute_min_hold=5,
+
+    # Time-of-day filter — identical to v4.16
+    time_filter_enabled=True,
+    time_filter_penalty_hours=[3, 6, 16, 17],
+    time_filter_extra_threshold=0.015,
+
+    # Signal strength filter — identical to v4.16
+    min_signal_strength=0.06,
+
+    # Directional bias breaker — identical to v4.16
+    direction_bias_enabled=True,
+    direction_bias_lookback=8,
+
+    # Loss streak cooldown — identical to v4.16
+    loss_streak_threshold=3,
+    loss_streak_extra_threshold=0.01,
+    loss_streak_max_extra=0.03,
+
+    # Drawdown-scaled sizing — identical to v4.16
+    drawdown_scaling_enabled=True,
+    drawdown_scaling_start=-0.005,
+    drawdown_scaling_floor=0.50,
+)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 _REGISTRY: Dict[str, StrategyConfig] = {
     "v4.15": V415_CONFIG,
     "v4.16": V416_CONFIG,
+    "v4.17": V417_CONFIG,
 }
 
 

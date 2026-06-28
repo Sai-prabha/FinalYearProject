@@ -121,10 +121,88 @@ export interface DataQuality {
   synced: boolean;
 }
 
+export interface BrokerExecLeg {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  reduce_only: boolean;
+  status: string;          // 'NEW' | 'FILLED' | 'REJECTED' | 'ERROR' | ...
+  order_id: string;
+  filled_qty: number;
+  avg_price: number;
+  error: string | null;
+  reconciled?: boolean;    // true once fill data confirmed via GET /fapi/v1/order
+}
+
+export interface BrokerExecEvent {
+  timestamp: string;
+  prev_pos: -1 | 0 | 1;
+  new_pos: -1 | 0 | 1;
+  transition: string;      // e.g. "FLAT→LONG"
+  legs: BrokerExecLeg[];
+  all_ok: boolean;
+  reconciled?: boolean;    // true once all legs have been reconciled
+}
+
+export interface BrokerConfigSummary {
+  mode: 'paper' | 'demo' | 'unknown';
+  auto_execute: boolean;
+  default_symbol: string;
+  default_qty: number;
+  default_btc_qty: number;
+  default_eth_qty: number;
+}
+
+export interface BrokerBalanceAsset {
+  asset: string;
+  balance: number;
+  available: number;
+}
+
+export interface BrokerBalanceResponse {
+  mode: string;
+  assets: BrokerBalanceAsset[];
+}
+
+export interface BrokerPosition {
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  size: number;
+  entry_price: number;
+  mark_price: number;
+  unrealized_pnl: number;
+  leverage: number;
+}
+
+export interface BrokerPositionsResponse {
+  mode: string;
+  positions: BrokerPosition[];
+}
+
+export interface OrderRequestPayload {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  order_type?: 'MARKET' | 'LIMIT';
+  quantity: number;
+  price?: number;
+  reduce_only?: boolean;
+  client_id?: string;
+}
+
+export interface OrderResponsePayload {
+  broker_order_id: string;
+  status: string;
+  filled_qty: number;
+  avg_price: number;
+  message?: string | null;
+}
+
 export interface ModelInfo {
   version: string;
   n_features: number;
   calc_time_ms: number;
+  broker?: BrokerConfigSummary;
+  last_exec?: BrokerExecEvent | null;
 }
 
 export interface ModelSignalData {
