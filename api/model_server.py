@@ -536,6 +536,23 @@ async def _reconcile_and_broadcast() -> None:
     )
 
 
+def _auto_exec_eligible() -> bool:
+    """Whether the per-candle auto-exec block runs at all.
+
+    True for BOTH demo (real testnet orders) and paper (simulated fills):
+    the guard/kill-switch/leg/event chain must behave identically in both, so
+    paper is a faithful rehearsal and the model never holds a position with no
+    execution trace. (The incident this fixes: paper mode used to skip the
+    block silently while the UI said "auto-execute ON".)
+    """
+    return (
+        broker_client is not None
+        and broker_config is not None
+        and broker_client.mode in ("demo", "paper")
+        and broker_config.auto_execute
+    )
+
+
 async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp: int) -> None:
     """Execute broker orders for a model position transition with leg-sync safety.
 
@@ -827,13 +844,11 @@ async def process_kline_message(data: Dict):
             broker_client.mode if broker_client else "none",
         )
 
-    # Auto-execute: detect position transitions and send dual-leg broker orders
-    if (
-        broker_client is not None
-        and broker_config is not None
-        and broker_client.mode == "demo"
-        and broker_config.auto_execute
-    ):
+    # Auto-execute: send dual-leg broker orders whenever model and broker
+    # positions differ. Runs every candle (not just on transitions), so drift
+    # from a restart mid-position / late auto-exec enable / broker recovery
+    # self-heals on the next candle instead of persisting silently.
+    if _auto_exec_eligible():
         _post_update_pos = signal_gen.position
         if _post_update_pos != _broker_position:
             blocked = False
@@ -865,19 +880,6 @@ async def process_kline_message(data: Dict):
                 await _execute_broker_position_change(
                     _broker_position, _post_update_pos, candle["time"]
                 )
-    elif (
-        broker_config is not None
-        and broker_config.auto_execute
-        and broker_client is not None
-        and broker_client.mode != "demo"
-    ):
-        # Warn once per candle so the operator knows orders are not being sent.
-        logger.warning(
-            "auto_execute=True but broker mode=%r — restart with BINANCE_ENV=demo "
-            "and credentials to send real Testnet orders",
-            broker_client.mode,
-        )
-
     # Build ALL features for frontend display & export (all 50)
     feature_values = {}
     for col in feature_names:
@@ -1163,6 +1165,16 @@ def _broker_summary() -> Dict:
         "default_eth_qty": broker_config.default_eth_qty if broker_config is not None else 0.05,
         "guards": execution_guards.to_dict() if execution_guards is not None else None,
         "kill_switch": kill_switch.to_dict() if kill_switch is not None else None,
+        # Model vs broker position (-1/0/+1). Drift means the broker was never
+        # told about the model's current position (entry happened while
+        # auto-exec was off / broker unavailable / before a restart). With
+        # auto-exec on it self-heals on the next candle; surfaced so the
+        # operator sees it rather than trusting silence.
+        "position_drift": {
+            "model": signal_gen.position if signal_gen is not None else 0,
+            "broker": _broker_position,
+            "drifted": (signal_gen.position if signal_gen is not None else 0) != _broker_position,
+        },
     }
 
 
@@ -1304,6 +1316,10 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
             "win_rate": (wins / closed) if closed else 0.0,
             "recent_trades": trades[-20:],
             "stats": compute_trade_stats(trades, getattr(gen, "starting_balance", 1000.0)),
+            # Degradation lens: same engine over only the last 20 closed trades,
+            # so recent form can be compared against lifetime honestly (n is
+            # reported; small-sample metrics stay suppressed).
+            "recent_stats": compute_trade_stats(trades[-20:], getattr(gen, "starting_balance", 1000.0)),
         }
 
     primary_trades = []
