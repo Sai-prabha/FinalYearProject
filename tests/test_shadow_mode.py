@@ -58,3 +58,41 @@ def test_shadow_persist_isolated(tmp_path, monkeypatch):
     # idempotent: no new trades → no rewrite growth
     ms._check_and_persist_shadow_trades()
     assert len(json.loads(shadow_file.read_text())) == 1
+
+
+def test_shadow_status_contract_has_stats_and_matched_window(tmp_path, monkeypatch):
+    """New additive keys: per-side stats, primary.window_stats, window_since."""
+    import asyncio
+
+    shadow_file = tmp_path / "shadow_trades.json"
+    primary_file = tmp_path / "trade_history.json"
+    # one old primary trade (before window) and one recent (inside window)
+    primary_file.write_text(json.dumps([
+        {"direction": "LONG", "pnl_pct": 1.0, "pnl_dollar": 10.0, "entry_time": 100, "exit_time": 200},
+        {"direction": "SHORT", "pnl_pct": -0.5, "pnl_dollar": -5.0, "entry_time": 5000, "exit_time": 5100},
+    ]))
+    shadow_file.write_text(json.dumps([
+        {"direction": "SHORT", "pnl_pct": 0.2, "pnl_dollar": 2.0, "entry_time": 4000, "exit_time": 4600},
+    ]))
+
+    monkeypatch.setattr(ms, "SHADOW_MODEL_VERSION", "v4.18")
+    monkeypatch.setattr(ms, "SHADOW_TRADES_JSON", shadow_file)
+    monkeypatch.setattr(ms, "TRADE_HISTORY_JSON", primary_file)
+    monkeypatch.setattr(ms, "signal_gen", ms._make_signal_gen("v4.16"))
+    monkeypatch.setattr(ms, "shadow_signal_gen", ms._make_signal_gen("v4.18"))
+
+    out = asyncio.run(ms.shadow_status(authorization=None))
+
+    assert out["enabled"] is True
+    # window anchored at the earliest shadow trade's entry_time
+    assert out["window_since"] == 4000
+    for side in ("primary", "shadow"):
+        assert out[side]["stats"]["n"] == out[side]["total_trades"]
+        assert "expectancy_pct" in out[side]["stats"]
+    # lifetime primary has both trades; matched window keeps only the recent one
+    assert out["primary"]["stats"]["n"] == 2
+    assert out["primary"]["window_stats"]["n"] == 1
+    assert out["primary"]["window_stats"]["total_pnl_dollar"] == -5.0
+    assert out["shadow"]["stats"]["n"] == 1
+    # small samples suppress sharpe rather than faking precision
+    assert out["primary"]["stats"]["sharpe_per_trade"] is None
