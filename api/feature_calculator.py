@@ -1058,6 +1058,13 @@ class V416SignalGenerator:
 
         self.cfg = cfg
 
+        # Asymmetric conviction thresholds (v4.18+). Fall back to the
+        # symmetric entry_threshold band when not configured.
+        self._long_thr = cfg.entry_threshold_long if cfg.entry_threshold_long is not None \
+            else cfg.entry_threshold
+        self._short_thr = cfg.entry_threshold_short if cfg.entry_threshold_short is not None \
+            else 1.0 - cfg.entry_threshold
+
         # Mirror the same param names used in V414SignalGenerator
         self.entry_threshold = cfg.entry_threshold
         self.exit_threshold = cfg.exit_threshold
@@ -1274,9 +1281,9 @@ class V416SignalGenerator:
             return self.cfg.absolute_min_hold
 
         # Strong opposite signal
-        if self.position == 1 and proba_up <= (1.0 - self.entry_threshold - 0.01):
+        if self.position == 1 and proba_up <= (self._short_thr - 0.01):
             return self.cfg.absolute_min_hold
-        if self.position == -1 and proba_up >= (self.entry_threshold + 0.01):
+        if self.position == -1 and proba_up >= (self._long_thr + 0.01):
             return self.cfg.absolute_min_hold
 
         return self.min_hold
@@ -1471,6 +1478,12 @@ class V416SignalGenerator:
                 elif self.current_stop_loss > 0 and current_ratio >= self.current_stop_loss:
                     early_exit_reason = "Stop loss"
 
+        # Time-based exit: position has been held to its horizon (v4.18+)
+        if (self.position != 0 and not early_exit_reason
+                and self.cfg.max_hold_bars > 0
+                and self.bars_since_change >= self.cfg.max_hold_bars):
+            early_exit_reason = "Max hold"
+
         # Unrealized PnL
         _unrealized_pnl_pct = 0.0
         if self.position != 0 and self.entry_ratio > 0:
@@ -1479,17 +1492,17 @@ class V416SignalGenerator:
             else:
                 _unrealized_pnl_pct = (self.entry_ratio - current_ratio) / self.entry_ratio
 
-        # ── Hysteresis logic ──
+        # ── Hysteresis logic (asymmetric-aware) ──
         if prev == 0:
-            if proba_up >= self.entry_threshold:
+            if proba_up >= self._long_thr:
                 desired = 1
-            elif proba_up <= (1.0 - self.entry_threshold):
+            elif proba_up <= self._short_thr:
                 desired = -1
         elif prev == 1:
             if can_change:
                 if early_exit_reason:
                     desired = 0
-                elif proba_up <= (1.0 - self.entry_threshold):
+                elif proba_up <= self._short_thr:
                     desired = -1
                 elif proba_up < self.exit_threshold:
                     desired = 0
@@ -1497,7 +1510,7 @@ class V416SignalGenerator:
             if can_change:
                 if early_exit_reason:
                     desired = 0
-                elif proba_up >= self.entry_threshold:
+                elif proba_up >= self._long_thr:
                     desired = 1
                 elif proba_up > (1.0 - self.exit_threshold):
                     desired = 0
@@ -1505,9 +1518,9 @@ class V416SignalGenerator:
         # ── Signal-exit guard ──
         if desired != prev and prev != 0 and not early_exit_reason:
             is_strong_flip = False
-            if prev == 1 and proba_up <= (1.0 - self.entry_threshold):
+            if prev == 1 and proba_up <= self._short_thr:
                 is_strong_flip = True
-            elif prev == -1 and proba_up >= self.entry_threshold:
+            elif prev == -1 and proba_up >= self._long_thr:
                 is_strong_flip = True
 
             if _unrealized_pnl_pct < 0 and not is_strong_flip:

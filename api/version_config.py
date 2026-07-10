@@ -78,6 +78,14 @@ class StrategyConfig:
     drawdown_scaling_start: float = -0.005  # Start scaling at this drawdown from peak
     drawdown_scaling_floor: float = 0.50    # Minimum fraction of normal position size
 
+    # --- Asymmetric conviction thresholds + time exit (v4.18) ---
+    # When set, these override the symmetric entry_threshold band:
+    # LONG entry requires proba >= entry_threshold_long,
+    # SHORT entry requires proba <= entry_threshold_short.
+    entry_threshold_long: float | None = None
+    entry_threshold_short: float | None = None
+    max_hold_bars: int = 0          # Force-exit position after N bars (0 = disabled)
+
 
 # ── V4.15 configuration (frozen baseline) ─────────────────────────────────
 
@@ -276,12 +284,83 @@ V417_CONFIG = StrategyConfig(
 )
 
 
+# ── V4.18 configuration (conviction gate — fee-aware redesign) ────────────
+# Motivation (2026-07-08 session, reports/eval/):
+#   With realistic taker fees (0.045%/side x 4 fills = 0.18% round trip),
+#   v4.15/16/17 are all deeply net-negative: their entries (|p-0.5| >= 0.025,
+#   ~25-70 bar holds) sit where the model edge is +0.01-0.03%/trade — 10x
+#   below the cost hurdle. The only edge that clears costs is the proba
+#   tail (p<0.45 SHORT / p>0.55 LONG) held for hours:
+#   aligned fwd edge +0.25% @240 bars, +0.69% @720, +1.09% @1440 (t=7-13).
+# Design: trade ONLY the tails, hold to a time horizon or strong reversal,
+# wide SL/TP so noise doesn't shake the position out, size ~<=1x equity.
+# All v4.16 churn-era gates (time filter, direction bias, loss streak) are
+# off — entries are already rare (~tens per quarter).
+#
+# Out-of-sample validation (Dec 2025 – Jul 2026 holdout, 286K bars):
+# the ONLY edge that replicates in BOTH windows is p<0.45 SHORT at a
+# ~240-bar (4h) horizon: +0.25% (t=7.4) tune / +0.22% (t=5.6) holdout.
+# Longer holds (720/1440) INVERT on the holdout (2026 ratio uptrend decays
+# stale shorts), and long-tail signals (p>0.55, n=15-73) flip sign between
+# windows. Hence: SHORT-ONLY, max_hold 240 bars. Long entries disabled
+# (entry_threshold_long > 1 is unreachable) until evidence supports them.
+
+V418_CONFIG = StrategyConfig(
+    # Legacy symmetric fields (still used for strong-flip exit checks)
+    entry_threshold=0.55,
+    exit_threshold=0.45,            # SHORT exits only on strong opposite (p > 0.55)
+    min_hold=30,
+    cooldown=30,
+
+    cb_lookback=500,
+    cb_threshold=-0.03,
+
+    # Wide SL/TP guardrails for a 4h hold (240-bar ratio sigma ~= 0.3%);
+    # the time exit is the primary exit, SL/TP only catch outliers
+    tp_sl_mode="asymmetric",
+    default_stop_loss_pct=-1.00,
+    default_take_profit_pct=1.80,
+    sl_vol_mult=1.5,
+    tp_vol_mult=2.3,
+    sl_strength_scale=0.0,
+    tp_strength_scale=0.0,
+
+    position_sizing_mode="vol_scaled_kelly",
+    target_win_frac=0.005,
+    min_leverage=0.30,
+    max_leverage=1.0,               # no leverage games on a thin edge
+    max_risk_per_trade=0.008,       # ~0.67x at the 1.2% default SL
+
+    trailing_breakeven_frac=0.50,
+    trailing_lock_frac=0.75,
+    trailing_lock_ratio=0.50,
+
+    absolute_min_hold=5,
+
+    time_filter_enabled=False,
+    time_filter_penalty_hours=[],
+    time_filter_extra_threshold=0.0,
+    min_signal_strength=0.0,        # implied by the tail thresholds
+    direction_bias_enabled=False,   # strategy is deliberately short-heavy
+    loss_streak_threshold=999,
+    drawdown_scaling_enabled=True,
+    drawdown_scaling_start=-0.02,
+    drawdown_scaling_floor=0.50,
+
+    # The actual conviction gate — SHORT-only (long tail not validated OOS)
+    entry_threshold_long=1.01,      # unreachable → long entries disabled
+    entry_threshold_short=0.45,
+    max_hold_bars=240,              # 4h time exit (the validated horizon)
+)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 _REGISTRY: Dict[str, StrategyConfig] = {
     "v4.15": V415_CONFIG,
     "v4.16": V416_CONFIG,
     "v4.17": V417_CONFIG,
+    "v4.18": V418_CONFIG,
 }
 
 

@@ -7,15 +7,24 @@
 #   - Create an account and generate API keys
 #   - Set BINANCE_ENV=demo
 #
-# LIVE (real trading, use extreme caution):
-#   - Go to https://www.binance.com/en/my/settings/api-management
-#   - Create API keys with Futures trading enabled
-#   - Set BINANCE_ENV=live
+# NOTE: this codebase is TESTNET-ONLY. The broker refuses to construct
+# against any host other than testnet.binancefuture.com (see
+# ALLOWED_BASE_HOSTS in api/broker_client.py), and BINANCE_ENV values other
+# than 'demo' always fall back to the simulated PaperBroker.
 
-export BINANCE_API_KEY='YOUR_API_KEY_HERE'
-export BINANCE_API_SECRET='YOUR_API_SECRET_HERE'
-export BINANCE_BASE_URL='https://testnet.binancefuture.com'   # or https://fapi.binance.com for live
-export BINANCE_ENV='demo'                                       # or 'live'
+export BINANCE_API_KEY='YOUR_TESTNET_API_KEY_HERE'
+export BINANCE_API_SECRET='YOUR_TESTNET_API_SECRET_HERE'
+export BINANCE_BASE_URL='https://testnet.binancefuture.com'
+export BINANCE_ENV='demo'
+
+# ── Optional safety rails (defaults shown) ──
+# export BROKER_DRY_RUN='false'          # true → orders go to /order/test only, never placed
+# export BROKER_SYMBOL_ALLOWLIST='BTCUSDT,ETHUSDT'
+# export BROKER_MAX_BTC_QTY='0.01'       # per-order cap
+# export BROKER_MAX_ETH_QTY='0.5'        # per-order cap
+#
+# Kill switch (no restart needed): touch data/live/KILL_SWITCH to block all
+# order placement; delete the file to re-enable.
 
 # Usage: source binance-env.sh before running the model server
 #   source binance-env.sh && python start_model_server.py

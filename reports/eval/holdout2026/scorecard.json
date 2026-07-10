@@ -1,0 +1,219 @@
+{
+  "generated": "2026-07-08T11:09:58.462446+00:00",
+  "window": {
+    "start": "2025-12-15",
+    "end": "2026-07-01"
+  },
+  "fee_bps_per_side": 4.5,
+  "fills_per_round_trip": 4,
+  "starting_balance": 1000.0,
+  "results": {
+    "v4.15": {
+      "gross": {
+        "n_trades": 3329,
+        "win_rate_pct": 68.1,
+        "expectancy_pct": 0.035,
+        "avg_win_pct": 0.1462,
+        "avg_loss_pct": -0.2026,
+        "win_loss_ratio": 0.722,
+        "profit_factor": 1.535,
+        "total_pnl_dollar": 230.22,
+        "final_equity": 63.56,
+        "max_drawdown_pct": -93.662,
+        "sharpe": 8.35,
+        "sortino": 7.35,
+        "avg_bars_held": 22.9,
+        "long_n": 2061,
+        "long_avg_pct": 0.0314,
+        "short_n": 1268,
+        "short_avg_pct": 0.0408,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 1798,
+            "avg_pct": 0.0673
+          },
+          "Stop loss": {
+            "n": 1081,
+            "avg_pct": -0.1658
+          },
+          "Take profit": {
+            "n": 450,
+            "avg_pct": 0.3882
+          }
+        }
+      },
+      "net": {
+        "n_trades": 3329,
+        "win_rate_pct": 19.44,
+        "expectancy_pct": -0.145,
+        "avg_win_pct": 0.158,
+        "avg_loss_pct": -0.2182,
+        "win_loss_ratio": 0.724,
+        "profit_factor": 0.187,
+        "total_pnl_dollar": -936.44,
+        "final_equity": 63.56,
+        "max_drawdown_pct": -93.662,
+        "sharpe": -34.63,
+        "sortino": -27.85,
+        "avg_bars_held": 22.9,
+        "long_n": 2061,
+        "long_avg_pct": -0.1486,
+        "short_n": 1268,
+        "short_avg_pct": -0.1392,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 1798,
+            "avg_pct": -0.1127
+          },
+          "Stop loss": {
+            "n": 1081,
+            "avg_pct": -0.3458
+          },
+          "Take profit": {
+            "n": 450,
+            "avg_pct": 0.2082
+          }
+        }
+      },
+      "bars_replayed": 285921
+    },
+    "v4.16": {
+      "gross": {
+        "n_trades": 1534,
+        "win_rate_pct": 67.41,
+        "expectancy_pct": 0.0447,
+        "avg_win_pct": 0.1715,
+        "avg_loss_pct": -0.2175,
+        "win_loss_ratio": 0.788,
+        "profit_factor": 1.654,
+        "total_pnl_dollar": 187.17,
+        "final_equity": 486.95,
+        "max_drawdown_pct": -51.521,
+        "sharpe": 9.52,
+        "sortino": 8.73,
+        "avg_bars_held": 21.7,
+        "long_n": 842,
+        "long_avg_pct": 0.0449,
+        "short_n": 692,
+        "short_avg_pct": 0.0443,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 763,
+            "avg_pct": 0.0845
+          },
+          "Stop loss": {
+            "n": 582,
+            "avg_pct": -0.141
+          },
+          "Take profit": {
+            "n": 189,
+            "avg_pct": 0.4554
+          }
+        }
+      },
+      "net": {
+        "n_trades": 1534,
+        "win_rate_pct": 22.49,
+        "expectancy_pct": -0.1353,
+        "avg_win_pct": 0.18,
+        "avg_loss_pct": -0.2268,
+        "win_loss_ratio": 0.793,
+        "profit_factor": 0.255,
+        "total_pnl_dollar": -513.05,
+        "final_equity": 486.95,
+        "max_drawdown_pct": -51.521,
+        "sharpe": -28.86,
+        "sortino": -24.75,
+        "avg_bars_held": 21.7,
+        "long_n": 842,
+        "long_avg_pct": -0.1351,
+        "short_n": 692,
+        "short_avg_pct": -0.1357,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 763,
+            "avg_pct": -0.0955
+          },
+          "Stop loss": {
+            "n": 582,
+            "avg_pct": -0.321
+          },
+          "Take profit": {
+            "n": 189,
+            "avg_pct": 0.2754
+          }
+        }
+      },
+      "bars_replayed": 285921
+    },
+    "v4.17": {
+      "gross": {
+        "n_trades": 1280,
+        "win_rate_pct": 61.33,
+        "expectancy_pct": 0.041,
+        "avg_win_pct": 0.1953,
+        "avg_loss_pct": -0.2038,
+        "win_loss_ratio": 0.958,
+        "profit_factor": 1.531,
+        "total_pnl_dollar": 146.17,
+        "final_equity": 537.18,
+        "max_drawdown_pct": -46.517,
+        "sharpe": 7.94,
+        "sortino": 7.74,
+        "avg_bars_held": 27.5,
+        "long_n": 685,
+        "long_avg_pct": 0.0467,
+        "short_n": 595,
+        "short_avg_pct": 0.0343,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 456,
+            "avg_pct": 0.0851
+          },
+          "Stop loss": {
+            "n": 623,
+            "avg_pct": -0.1189
+          },
+          "Take profit": {
+            "n": 201,
+            "avg_pct": 0.4362
+          }
+        }
+      },
+      "net": {
+        "n_trades": 1280,
+        "win_rate_pct": 23.67,
+        "expectancy_pct": -0.139,
+        "avg_win_pct": 0.1895,
+        "avg_loss_pct": -0.241,
+        "win_loss_ratio": 0.787,
+        "profit_factor": 0.263,
+        "total_pnl_dollar": -462.82,
+        "final_equity": 537.18,
+        "max_drawdown_pct": -46.517,
+        "sharpe": -26.94,
+        "sortino": -22.51,
+        "avg_bars_held": 27.5,
+        "long_n": 685,
+        "long_avg_pct": -0.1333,
+        "short_n": 595,
+        "short_avg_pct": -0.1457,
+        "exit_reasons": {
+          "Signal change": {
+            "n": 456,
+            "avg_pct": -0.0949
+          },
+          "Stop loss": {
+            "n": 623,
+            "avg_pct": -0.2989
+          },
+          "Take profit": {
+            "n": 201,
+            "avg_pct": 0.2562
+          }
+        }
+      },
+      "bars_replayed": 285921
+    }
+  }
+}

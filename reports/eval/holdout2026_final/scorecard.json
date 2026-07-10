@@ -1,0 +1,89 @@
+{
+  "generated": "2026-07-08T11:13:29.547803+00:00",
+  "window": {
+    "start": "2025-12-15",
+    "end": "2026-07-01"
+  },
+  "fee_bps_per_side": 4.5,
+  "fills_per_round_trip": 4,
+  "starting_balance": 1000.0,
+  "results": {
+    "v4.18": {
+      "gross": {
+        "n_trades": 78,
+        "win_rate_pct": 47.44,
+        "expectancy_pct": 0.095,
+        "avg_win_pct": 0.5802,
+        "avg_loss_pct": -0.3428,
+        "win_loss_ratio": 1.692,
+        "profit_factor": 1.55,
+        "total_pnl_dollar": 26.52,
+        "final_equity": 978.08,
+        "max_drawdown_pct": -3.686,
+        "sharpe": 3.74,
+        "sortino": 5.51,
+        "avg_bars_held": 151.1,
+        "long_n": 0,
+        "long_avg_pct": null,
+        "short_n": 78,
+        "short_avg_pct": 0.095,
+        "exit_reasons": {
+          "Max hold": {
+            "n": 40,
+            "avg_pct": 0.3411
+          },
+          "Signal change": {
+            "n": 29,
+            "avg_pct": -0.3382
+          },
+          "Stop loss": {
+            "n": 6,
+            "avg_pct": -0.5071
+          },
+          "Take profit": {
+            "n": 3,
+            "avg_pct": 2.2066
+          }
+        }
+      },
+      "net": {
+        "n_trades": 78,
+        "win_rate_pct": 37.18,
+        "expectancy_pct": -0.085,
+        "avg_win_pct": 0.5304,
+        "avg_loss_pct": -0.4492,
+        "win_loss_ratio": 1.181,
+        "profit_factor": 0.71,
+        "total_pnl_dollar": -21.92,
+        "final_equity": 978.08,
+        "max_drawdown_pct": -3.686,
+        "sharpe": -3.34,
+        "sortino": -3.98,
+        "avg_bars_held": 151.1,
+        "long_n": 0,
+        "long_avg_pct": null,
+        "short_n": 78,
+        "short_avg_pct": -0.085,
+        "exit_reasons": {
+          "Max hold": {
+            "n": 40,
+            "avg_pct": 0.1611
+          },
+          "Signal change": {
+            "n": 29,
+            "avg_pct": -0.5182
+          },
+          "Stop loss": {
+            "n": 6,
+            "avg_pct": -0.6871
+          },
+          "Take profit": {
+            "n": 3,
+            "avg_pct": 2.0266
+          }
+        }
+      },
+      "bars_replayed": 285921
+    }
+  }
+}
