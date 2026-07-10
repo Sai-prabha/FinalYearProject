@@ -40,6 +40,7 @@ from xgboost import XGBClassifier
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .version_config import get_strategy_config, list_versions
 from .broker_client import (
+    JSONL_LOG_PATH,
     BrokerClient,
     OrderRequest,
     OrderResponse,
@@ -109,6 +110,9 @@ LIVE_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "live"
 TRADE_HISTORY_JSON = LIVE_DATA_DIR / "trade_history.json"
 KILL_SWITCH_JSON = LIVE_DATA_DIR / "kill_switch.json"
 TRADE_HISTORY_CSV = LIVE_DATA_DIR / "trade_history.csv"
+# Append-only log of auto-execute events (one row on submit, one on
+# reconcile). Read back by GET /broker/executions, deduped by timestamp.
+EXEC_EVENTS_JSONL = LIVE_DATA_DIR / "exec_events.jsonl"
 
 # ── Data API ──────────────────────────────────────────────────────────────
 REST_BASE = "https://api.binance.com/api/v3"
@@ -210,6 +214,46 @@ def _persist_trade(trade: Dict):
         writer.writerow(trade)
 
     logger.info(f"Trade persisted: {trade['direction']} PnL={trade['pnl_pct']:.3f}%")
+
+
+def _persist_exec_event(event: Dict) -> None:
+    """Append an execution event snapshot to the JSONL history.
+
+    Called twice per event (on submit and after fill reconciliation); the
+    read path keeps the newest row per event timestamp. Never raises.
+    """
+    try:
+        _ensure_live_dir()
+        with open(EXEC_EVENTS_JSONL, "a") as f:
+            f.write(json.dumps(_sanitize_for_json(event), default=str) + "\n")
+    except Exception as e:
+        logger.warning(f"Exec event persist failed: {e}")
+
+
+def _read_jsonl_tail(path: Path, limit: int) -> list:
+    """Read up to ``limit`` newest valid JSON rows from a JSONL file.
+
+    Malformed lines are skipped — an interrupted write must not take the
+    whole history endpoint down. Returns rows oldest→newest.
+    """
+    if not path.exists():
+        return []
+    rows: list = []
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.warning(f"JSONL read failed ({path.name}): {e}")
+        return []
+    for line in lines[-max(limit * 3, limit):]:  # slack for dedup/filter passes
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
 
 
 def _make_signal_gen(version: str):
@@ -473,6 +517,7 @@ async def _reconcile_and_broadcast() -> None:
     # only updates fill details, it does not override a partial-failure outcome.
     _last_execution_event["all_ok"] = _last_execution_event.get("outcome") == "OK"
     _last_execution_event["reconciled"] = True
+    _persist_exec_event(_last_execution_event)
     # Broadcast a lightweight message so the frontend doesn't wait for the next candle
     await broadcast_to_clients({
         "type": "exec_reconciled",
@@ -541,6 +586,7 @@ async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp
             _last_execution_event = _build_exec_event(
                 prev_pos, new_pos, prev_pos, exit_legs, [], [], "EXIT_PARTIAL_FAILURE"
             )
+            _persist_exec_event(_last_execution_event)
             await broadcast_to_clients({"type": "exec_event", "last_exec": _last_execution_event})
             asyncio.create_task(_reconcile_and_broadcast())
             return
@@ -605,6 +651,7 @@ async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp
     _last_execution_event = _build_exec_event(
         prev_pos, new_pos, final_pos, exit_legs, entry_legs, unwind_legs, outcome
     )
+    _persist_exec_event(_last_execution_event)
     logger.info(
         "AUTO-EXEC [%s] %s→%s confirmed→%s (%d exit / %d entry / %d unwind legs): %s",
         outcome,
@@ -1101,6 +1148,9 @@ def _broker_summary() -> Dict:
     """Compact broker snapshot exposed in /status and WS payloads."""
     return {
         "mode": broker_client.mode if broker_client is not None else "unknown",
+        # Why the demo broker fell back to paper (e.g. expired testnet keys);
+        # None when the broker is running as configured.
+        "init_error": getattr(broker_client, "init_error", None),
         "auto_execute": broker_config.auto_execute if broker_config is not None else False,
         "default_symbol": broker_config.default_symbol if broker_config is not None else "BTCUSDT",
         "default_qty": broker_config.default_qty if broker_config is not None else 0.001,
@@ -1406,10 +1456,69 @@ async def update_broker_config_route(
 
 @app.get("/broker/balance")
 async def get_broker_balance(authorization: Optional[str] = Header(None)):
+    """Account balances. Additive fields: ``ok`` and ``error`` expose a broker
+    error envelope (e.g. expired testnet keys) instead of an ambiguous empty
+    list. Existing keys (``mode``, ``assets``, ``raw``) are unchanged."""
     _require_auth_or_skip(authorization)
     bc = _broker_or_503()
     balance = await asyncio.to_thread(bc.get_balance)
-    return {"mode": bc.mode, **balance}
+    raw = balance.get("raw")
+    error = None
+    if isinstance(raw, dict) and isinstance(raw.get("code"), int) and raw["code"] < 0:
+        error = f"{raw.get('code')}: {raw.get('msg', 'unknown broker error')}"
+    init_error = getattr(bc, "init_error", None)
+    if error is None and init_error:
+        error = f"broker degraded to paper: {init_error}"
+    return {"mode": bc.mode, "ok": error is None, "error": error, **balance}
+
+
+# Broker-log actions that constitute order activity (polling reads like
+# get_balance/get_order_status are logged too but are noise for operators).
+_ACTIVITY_ACTIONS = {
+    "place_order",
+    "place_test_order",
+    "cancel_order",
+    "bracket_stop_market",
+    "bracket_take_profit_market",
+}
+
+
+@app.get("/broker/executions")
+async def get_broker_executions(
+    limit: int = Query(50, ge=1, le=200),
+    authorization: Optional[str] = Header(None),
+):
+    """Auto-execute event history (persisted across restarts).
+
+    Each event appears once, newest first, with its most recent snapshot
+    (reconciled fills win over the submit-time row).
+    """
+    _require_auth_or_skip(authorization)
+    rows = _read_jsonl_tail(EXEC_EVENTS_JSONL, limit)
+    latest_by_ts: Dict[str, dict] = {}
+    for row in rows:  # oldest→newest, so later (reconciled) rows overwrite
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            latest_by_ts[ts] = row
+    events = sorted(latest_by_ts.values(), key=lambda r: r.get("timestamp", ""), reverse=True)
+    events = events[:limit]
+    return {"executions": events, "count": len(events)}
+
+
+@app.get("/broker/activity")
+async def get_broker_activity(
+    limit: int = Query(50, ge=1, le=200),
+    authorization: Optional[str] = Header(None),
+):
+    """Order-level broker interactions (orders, brackets, cancels), newest
+    first, from the append-only broker log. Secrets are redacted at write
+    time. Read-only view — nothing here mutates broker or history state."""
+    _require_auth_or_skip(authorization)
+    rows = _read_jsonl_tail(JSONL_LOG_PATH, limit * 4)  # log includes non-activity rows
+    activity = [r for r in rows if r.get("action") in _ACTIVITY_ACTIONS]
+    activity.reverse()  # newest first
+    activity = activity[:limit]
+    return {"activity": activity, "count": len(activity)}
 
 
 @app.get("/broker/positions")

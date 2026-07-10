@@ -120,6 +120,11 @@ class BrokerClient(ABC):
     """Generic broker interface. Implementations must set ``mode``."""
 
     mode: str  # "demo" | "paper"
+    # Why the real broker was NOT constructed (e.g. expired testnet keys).
+    # None when this broker is running as intended; surfaced via /broker/*
+    # endpoints so operators can see degraded state instead of a silent
+    # paper fallback.
+    init_error: Optional[str] = None
 
     @abstractmethod
     def place_order(self, req: OrderRequest) -> OrderResponse: ...
@@ -612,7 +617,12 @@ def make_broker_client() -> BrokerClient:
         logger.info("=" * 60)
         return broker
     except BrokerConfigError as e:
-        logger.warning(f"Broker: config incomplete ({e}); using PaperBroker")
+        reason = str(e)
+        logger.warning(f"Broker: config incomplete ({reason}); using PaperBroker")
     except Exception as e:
+        reason = f"init failed: {e}"
         logger.warning(f"Broker: live init failed ({e}); using PaperBroker")
-    return PaperBroker()
+
+    fallback = PaperBroker()
+    fallback.init_error = reason
+    return fallback
