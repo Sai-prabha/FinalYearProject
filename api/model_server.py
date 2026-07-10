@@ -38,6 +38,7 @@ from jose import JWTError, jwt
 from xgboost import XGBClassifier
 
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
+from .trade_stats import compute_trade_stats
 from .version_config import get_strategy_config, list_versions
 from .broker_client import (
     JSONL_LOG_PATH,
@@ -150,6 +151,10 @@ active_connections: Set[WebSocket] = set()
 
 # Track last known trade count for persistence
 _last_trade_count: int = 0
+
+# Anchors the baseline-vs-candidate matched comparison window when no shadow
+# trade exists yet (the window otherwise starts at the earliest shadow trade).
+_SERVER_STARTED_TS = time.time()
 
 # Shadow candidate generator (None unless SHADOW_MODEL_VERSION is set)
 shadow_signal_gen = None  # V414SignalGenerator | V416SignalGenerator
@@ -1298,6 +1303,7 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
             "losses": losses,
             "win_rate": (wins / closed) if closed else 0.0,
             "recent_trades": trades[-20:],
+            "stats": compute_trade_stats(trades, getattr(gen, "starting_balance", 1000.0)),
         }
 
     primary_trades = []
@@ -1308,11 +1314,27 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
         except Exception:
             primary_trades = []
 
+    # Matched comparison window: lifetime baseline stats aren't comparable to a
+    # candidate that only started observing recently, so the primary side also
+    # gets stats restricted to the shadow's observation window (earliest shadow
+    # trade, or this server boot when the shadow hasn't traded yet).
+    window_since = _SERVER_STARTED_TS
+    if shadow_trades:
+        first_shadow = min((t.get("entry_time") or window_since) for t in shadow_trades)
+        window_since = min(window_since, first_shadow)
+    primary_in_window = [t for t in primary_trades if (t.get("exit_time") or 0) >= window_since]
+
+    primary_side = _side(signal_gen, primary_trades)
+    primary_side["window_stats"] = compute_trade_stats(
+        primary_in_window, getattr(signal_gen, "starting_balance", 1000.0)
+    )
+
     return _sanitize_for_json({
         "enabled": True,
         "primary_version": MODEL_VERSION,
         "shadow_version": SHADOW_MODEL_VERSION,
-        "primary": _side(signal_gen, primary_trades),
+        "window_since": window_since,
+        "primary": primary_side,
         "shadow": _side(shadow_signal_gen, shadow_trades),
         "last_shadow_signal": _last_shadow_signal,
     })
