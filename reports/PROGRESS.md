@@ -158,3 +158,35 @@ Checklist to go live on testnet:
   API Key tab → regenerate → paste the new key/secret into binance-env.sh. Then:
   `source binance-env.sh && .venv/bin/python start_model_server.py --model-version v4.18`
   (browser session wasn't available from this session — Chrome extension not connected).
+
+## Addendum — v4.18.2 candidate evaluation: NOT READY (2026-07-10)
+
+Question: can v4.18 be improved into an honest v4.18.2 (per the ratchet: beat v4.18 NET on holdout2026)?
+
+Evidence gathered this session (all with `scripts/fast_backtest.py`, parity-exact, fee-aware):
+- Existing sweep (`reports/eval/sweep_v418.csv`): every (short_thr × max_hold) combo around the v4.18
+  config is net-negative on at least one window at taker fees (4.5 bps/side × 4 fills = 0.18% RT).
+  The 0.44 tail (+0.176% tune) collapses OOS (−0.196% holdout, n=11–12) — small-n overfit, not signal.
+- NEW maker-fill upper bound (2.0 bps/side, i.e. assuming 100% post-only fills with zero adverse
+  selection — deliberately over-generous):
+  - holdout2026 (2025-12-15→2026-07-01): NET exp +0.015%/trade, PF 1.06, PnL +$3.84, Sharpe 0.59 (n=78)
+  - tune2025   (2025-10-01→2025-12-15): NET exp −0.076%/trade, PF 0.715, PnL −$16.15 (n=58)
+  → Even the best-case execution upgrade does not clear the ratchet on both windows.
+  Artifacts: `reports/eval/holdout2026_maker2bps/`, `reports/eval/tune2025_maker2bps/`.
+
+Verdict: **v4.18.2 is not created.** The gross edge of the fixed v4.14 weights (~+0.1%/trade on
+holdout, ~0% on tune2025) sits below or at the cost floor under every implementable configuration.
+Renaming v4.18 would violate the no-rename rule. The only credible paths to a real v4.18.2 remain:
+(1) retrain weights through 2025-12 and re-evaluate net on 2026 holdout, (2) 4h-horizon labels,
+(3) maker-entry execution WITH an honest fill model (limit-through price check), each gated by this
+same harness before any version bump.
+
+Baseline comparison note: v4.18 is NOT underperforming v4.15 — net-of-fees v4.15 ≈ −$766/$1k/quarter
+(−77% DD) vs v4.18's ~−1%/mo (−3.7% DD). Live shadow sample (v4.18 on Railway) is n=0 trades as of
+2026-07-10 — far below any decision threshold; the harness remains the evidence standard.
+
+- 2026-07-10: Incident fixed in `api/model_server.py`: auto-exec was gated to `mode=="demo"`, so paper
+  mode silently skipped execution while the UI said auto-execute ON (model LONG, no execution trace).
+  Auto-exec now runs in paper too (identical guard/kill-switch/leg/event flow, legs labeled paper);
+  `_broker_summary()` exposes `position_drift`; drift self-heals via the every-candle position check.
+  Tests: `tests/test_incident_paper_routing.py` (4), suite 52/52 + auto-exec e2e green.
