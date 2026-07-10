@@ -2,6 +2,13 @@
 
 Final Year Project: Machine Learning-based BTC/ETH ratio trading strategy with live model server and React dashboard.
 
+> **State of play (2026-07-08) — read `reports/PROGRESS.md` first.** Fee-aware evaluation
+> (`scripts/fast_backtest.py`, parity-exact with the live path) showed all pre-v4.18 configs are
+> net-negative after taker fees; v4.18 ("conviction gate", `--model-version v4.18`) is the
+> recommended demo default. Execution is hard-pinned to Binance Futures **Testnet**
+> (host allowlist, kill switch `data/live/KILL_SWITCH`, dry-run `BROKER_DRY_RUN=true`,
+> per-order caps — see `binance-env.sh.example`). Safety/e2e tests: `tests/`.
+
 ## Project Structure
 
 ```

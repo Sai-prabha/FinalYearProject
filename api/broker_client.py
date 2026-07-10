@@ -43,6 +43,47 @@ JSONL_LOG_PATH = LIVE_DATA_DIR / "binance_trades_demo.jsonl"
 # Fields that must never reach disk in cleartext.
 _REDACTED_KEYS = {"apiKey", "apikey", "X-MBX-APIKEY", "secret", "signature"}
 
+# ── Hard safety rails (demo/testnet-only project) ─────────────────────────
+# Only these hosts may ever receive a signed order. Production hosts
+# (fapi.binance.com etc.) are structurally unreachable from this codebase.
+ALLOWED_BASE_HOSTS = {"testnet.binancefuture.com"}
+
+# Per-order quantity caps and symbol allowlist. Env-overridable but with
+# tiny defaults; the gate rejects anything outside them before signing.
+def _safety_limits() -> dict:
+    allowlist = os.environ.get("BROKER_SYMBOL_ALLOWLIST", "BTCUSDT,ETHUSDT")
+    return {
+        "symbols": {s.strip().upper() for s in allowlist.split(",") if s.strip()},
+        "max_qty": {
+            "BTCUSDT": float(os.environ.get("BROKER_MAX_BTC_QTY", "0.01")),
+            "ETHUSDT": float(os.environ.get("BROKER_MAX_ETH_QTY", "0.5")),
+        },
+        "default_max_qty": float(os.environ.get("BROKER_MAX_QTY", "0.01")),
+    }
+
+
+# Flip-at-runtime kill switch: create this file to block all order placement
+# (touch data/live/KILL_SWITCH). Checked on every order, no restart needed.
+KILL_SWITCH_PATH = LIVE_DATA_DIR / "KILL_SWITCH"
+
+
+def _dry_run_enabled() -> bool:
+    return os.environ.get("BROKER_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+
+def check_order_safety(req: "OrderRequest") -> Optional[str]:
+    """Return a rejection reason if the order violates any safety rail, else None."""
+    if KILL_SWITCH_PATH.exists():
+        return f"KILL SWITCH active ({KILL_SWITCH_PATH}) — delete the file to re-enable trading"
+    limits = _safety_limits()
+    sym = req.symbol.upper()
+    if sym not in limits["symbols"]:
+        return f"symbol {sym} not in allowlist {sorted(limits['symbols'])}"
+    max_qty = limits["max_qty"].get(sym, limits["default_max_qty"])
+    if req.quantity > max_qty:
+        return f"quantity {req.quantity} exceeds max {max_qty} for {sym}"
+    return None
+
 
 class BrokerConfigError(RuntimeError):
     """Raised when a real broker cannot be constructed from the environment."""
@@ -164,6 +205,16 @@ class BinanceFuturesBroker(BrokerClient):
         if not api_key or not api_secret or not base_url:
             raise BrokerConfigError(
                 "BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL all required"
+            )
+
+        # Hard testnet pin: refuse to construct against any non-testnet host,
+        # regardless of what BINANCE_ENV claims. This makes production
+        # endpoints structurally unreachable even with valid live keys.
+        host = base_url.split("//", 1)[-1].split("/", 1)[0].lower()
+        if host not in ALLOWED_BASE_HOSTS:
+            raise BrokerConfigError(
+                f"BINANCE_BASE_URL host {host!r} is not an approved testnet host "
+                f"{sorted(ALLOWED_BASE_HOSTS)} — refusing to initialize"
             )
 
         self._api_key = api_key
@@ -322,6 +373,19 @@ class BinanceFuturesBroker(BrokerClient):
     # -- Public API --
 
     def place_order(self, req: OrderRequest) -> OrderResponse:
+        reason = check_order_safety(req)
+        if reason is not None:
+            r = OrderResponse(broker_order_id="", status="REJECTED", message=f"SAFETY: {reason}")
+            logger.warning(f"Order blocked by safety gate: {reason}")
+            self._log_interaction("place_order", req.model_dump(), r.model_dump(), error=reason)
+            return r
+
+        if _dry_run_enabled():
+            # Validate signing/params via the test endpoint; never places.
+            resp = self.place_test_order(req)
+            resp.message = f"DRY RUN — no order placed ({resp.message})"
+            return resp
+
         try:
             params = self._build_order_params(req)
         except ValueError as e:
@@ -473,6 +537,11 @@ class PaperBroker(BrokerClient):
     mode = "paper"
 
     def place_order(self, req: OrderRequest) -> OrderResponse:
+        reason = check_order_safety(req)
+        if reason is not None:
+            r = OrderResponse(broker_order_id="", status="REJECTED", message=f"SAFETY: {reason}")
+            self._log_interaction("place_order", req.model_dump(), r.model_dump(), error=reason)
+            return r
         oid = f"paper-{uuid.uuid4().hex[:12]}"
         result = OrderResponse(
             broker_order_id=oid,
@@ -526,8 +595,21 @@ def make_broker_client() -> BrokerClient:
 
     try:
         broker = BinanceFuturesBroker()
-        broker.get_balance()  # smoke test
-        logger.info("Broker: BinanceFuturesBroker ready (Testnet)")
+        # Smoke test must actually prove auth works: get_balance() swallows
+        # Binance error envelopes (e.g. -2015 invalid/expired key), so check
+        # for one explicitly instead of treating any response as success.
+        bal = broker.get_balance()
+        raw = bal.get("raw")
+        if isinstance(raw, dict) and isinstance(raw.get("code"), int) and raw["code"] < 0:
+            raise BrokerConfigError(
+                f"Testnet auth failed ({raw.get('code')}: {raw.get('msg')}) — "
+                "keys likely expired; regenerate at https://testnet.binancefuture.com"
+            )
+        logger.info("=" * 60)
+        logger.info("🟢 BROKER: BINANCE FUTURES **TESTNET / DEMO ONLY** 🟢")
+        logger.info(f"   host pinned to {sorted(ALLOWED_BASE_HOSTS)}")
+        logger.info(f"   dry_run={_dry_run_enabled()} kill_switch={KILL_SWITCH_PATH.exists()}")
+        logger.info("=" * 60)
         return broker
     except BrokerConfigError as e:
         logger.warning(f"Broker: config incomplete ({e}); using PaperBroker")
