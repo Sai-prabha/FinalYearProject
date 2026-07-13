@@ -372,6 +372,18 @@ def get_strategy_config(version: str) -> StrategyConfig:
     return _REGISTRY[version]
 
 
+def register_version(version: str, cfg: StrategyConfig) -> None:
+    """Register a runtime version (strategy-lab shadow candidates, `lab-*`).
+
+    Runtime-only: registrations do not survive a restart — the lab's shadow
+    registration file re-registers its candidate on boot. Static versions in
+    this module cannot be overwritten.
+    """
+    if version in ("v4.15", "v4.16", "v4.17", "v4.18"):
+        raise ValueError(f"Refusing to overwrite static version '{version}'")
+    _REGISTRY[version] = cfg
+
+
 def list_versions() -> List[str]:
     """Return all registered version strings."""
     return sorted(_REGISTRY.keys())

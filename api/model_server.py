@@ -40,7 +40,8 @@ from xgboost import XGBClassifier
 
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .trade_stats import compute_trade_stats
-from .version_config import get_strategy_config, list_versions
+from .version_config import get_strategy_config, list_versions, register_version
+from . import strategy_lab
 from .broker_client import (
     JSONL_LOG_PATH,
     BrokerClient,
@@ -294,6 +295,43 @@ def _make_signal_gen(version: str):
             cb_threshold=strategy["cb_threshold"],
         )
     return V416SignalGenerator(cfg=get_strategy_config(version))
+
+
+def _activate_shadow(version: str) -> None:
+    """(Re)build the shadow slot for a version: generator, persistence file,
+    counters. Used at boot (env or lab registration) and by the run-in-shadow
+    endpoint. The slot stays evaluation-only — nothing here touches the broker."""
+    global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON
+    SHADOW_MODEL_VERSION = version
+    SHADOW_TRADES_JSON = LIVE_DATA_DIR / f"shadow_{version.replace('.', '_')}_trades.json"
+    shadow_signal_gen = _make_signal_gen(version)
+    _shadow_last_trade_count = 0
+    _last_shadow_signal = None
+    if SHADOW_TRADES_JSON.exists():
+        try:
+            with open(SHADOW_TRADES_JSON, "r") as f:
+                shadow_trades = json.load(f)
+            if shadow_trades:
+                shadow_signal_gen.restore_from_trades(shadow_trades)
+                _shadow_last_trade_count = len(shadow_trades)
+        except Exception as e:
+            logger.warning(f"  Could not restore shadow trades: {e}")
+    logger.info(
+        f"  SHADOW mode: {version} "
+        f"({type(shadow_signal_gen).__name__}) → {SHADOW_TRADES_JSON}"
+    )
+
+
+def _deactivate_shadow() -> None:
+    """Empty the shadow slot (stop endpoint / promotion)."""
+    global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON
+    shadow_signal_gen = None
+    SHADOW_MODEL_VERSION = ""
+    SHADOW_TRADES_JSON = None
+    _shadow_last_trade_count = 0
+    _last_shadow_signal = None
 
 
 def _check_and_persist_shadow_trades():
@@ -1268,23 +1306,21 @@ async def lifespan(app: FastAPI):
     signal_gen = _make_signal_gen(version)
     logger.info(f"  Signal generator: {type(signal_gen).__name__} ({version})")
 
-    # Shadow candidate generator — isolated instance, own persistence file
-    global shadow_signal_gen, _shadow_last_trade_count
-    if SHADOW_MODEL_VERSION:
-        shadow_signal_gen = _make_signal_gen(SHADOW_MODEL_VERSION)
-        if SHADOW_TRADES_JSON and SHADOW_TRADES_JSON.exists():
-            try:
-                with open(SHADOW_TRADES_JSON, "r") as f:
-                    shadow_trades = json.load(f)
-                if shadow_trades:
-                    shadow_signal_gen.restore_from_trades(shadow_trades)
-                    _shadow_last_trade_count = len(shadow_trades)
-            except Exception as e:
-                logger.warning(f"  Could not restore shadow trades: {e}")
-        logger.info(
-            f"  SHADOW mode: {SHADOW_MODEL_VERSION} "
-            f"({type(shadow_signal_gen).__name__}) → {SHADOW_TRADES_JSON}"
-        )
+    # Shadow candidate generator — isolated instance, own persistence file.
+    # A strategy-lab registration (run-in-shadow) survives restarts and takes
+    # precedence over the SHADOW_MODEL_VERSION env; with no registration file
+    # the env behaves exactly as before.
+    shadow_version = SHADOW_MODEL_VERSION
+    reg = strategy_lab.read_shadow_registration()
+    if reg:
+        try:
+            register_version(reg["version"], strategy_lab.registration_config(reg))
+            shadow_version = reg["version"]
+            logger.info(f"  Shadow registration restored: {reg['version']} ({reg.get('label')})")
+        except Exception as e:
+            logger.warning(f"  Shadow registration restore failed: {e}")
+    if shadow_version:
+        _activate_shadow(shadow_version)
 
     # Ensure trade persistence directory exists
     _ensure_live_dir()
@@ -1364,6 +1400,11 @@ async def lifespan(app: FastAPI):
 
     # 4. Start data WebSocket task
     data_task = asyncio.create_task(connect_to_data_stream())
+
+    # 5. Strategy-lab research scheduler (RESEARCH_AUTO=0 disables). Getters
+    # read module globals at call time so promotions are picked up.
+    research_task = asyncio.create_task(strategy_lab.scheduler_loop(
+        lambda: (model, feature_names), lambda: MODEL_VERSION))
     logger.info("=" * 80)
     logger.info(f"{version.upper()} MODEL SERVER - READY")
     logger.info("=" * 80)
@@ -1372,11 +1413,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down model server...")
-    data_task.cancel()
-    try:
-        await data_task
-    except asyncio.CancelledError:
-        pass
+    for task in (data_task, research_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # ── Auth helpers ────────────────────────────────────────────────────────────
@@ -1629,8 +1671,14 @@ async def promote_model(req: PromoteRequest, authorization: Optional[str] = Head
     MODEL_VERSION = req.version
     # The candidate is live now — the shadow slot retires (its trades file
     # stays on disk as the evaluation record).
-    shadow_signal_gen = None
-    SHADOW_MODEL_VERSION = ""
+    _deactivate_shadow()
+
+    # Strategy-lab bookkeeping: a promoted lab candidate leaves the shadow
+    # registration behind and its lifecycle becomes PROMOTED (best-effort).
+    reg = strategy_lab.read_shadow_registration()
+    if reg and reg.get("version") == req.version:
+        strategy_lab.clear_shadow_registration(reason="promoted to live")
+        strategy_lab.set_lifecycle(reg["candidate_id"], "PROMOTED", reason="promoted to live")
 
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1725,15 +1773,174 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
         primary_in_window, getattr(signal_gen, "starting_balance", 1000.0)
     )
 
+    shadow_side = _side(shadow_signal_gen, shadow_trades)
+
+    # Strategy-lab context: which candidate occupies the slot (None for a
+    # plain env-configured shadow) + continuous promotion-readiness signal.
+    reg = strategy_lab.read_shadow_registration()
+    candidate = None
+    readiness_since = window_since
+    if reg and reg.get("version") == SHADOW_MODEL_VERSION:
+        candidate = {
+            "candidate_id": reg["candidate_id"],
+            "label": reg.get("label"),
+            "registered_ts": reg.get("registered_ts"),
+        }
+        try:
+            readiness_since = datetime.fromisoformat(reg["registered_ts"]).timestamp()
+        except Exception:
+            pass
+    readiness = strategy_lab.promotion_readiness(
+        readiness_since, shadow_side["stats"], primary_side["window_stats"])
+
     return _sanitize_for_json({
         "enabled": True,
         "primary_version": MODEL_VERSION,
         "shadow_version": SHADOW_MODEL_VERSION,
         "window_since": window_since,
         "primary": primary_side,
-        "shadow": _side(shadow_signal_gen, shadow_trades),
+        "shadow": shadow_side,
         "last_shadow_signal": _last_shadow_signal,
+        "candidate": candidate,
+        "readiness": readiness,
     })
+
+
+# ── Strategy lab: research → deploy-candidate → shadow ─────────────────────
+# Design record: STRATEGY_LAB.md. Research jobs replay disciplined config
+# families over cached model probabilities (walk-forward folds + reserved
+# holdout, fee-aware) and gate deploy-candidates explicitly. The shadow slot
+# stays evaluation-only — broker orders come from the primary path alone.
+
+
+@app.get("/research/status")
+async def research_status(authorization: Optional[str] = Header(None)):
+    """Scheduler + current job + last-run leaderboard summary."""
+    _require_auth_or_skip(authorization)
+    store = strategy_lab.load_candidates()
+    summary = None
+    if store:
+        counts: Dict[str, int] = {}
+        for c in store["candidates"]:
+            counts[c["lifecycle"]] = counts.get(c["lifecycle"], 0) + 1
+        summary = {
+            "run_id": store.get("run_id"),
+            "generated": store.get("generated"),
+            "trigger": store.get("trigger"),
+            "depth": store.get("depth"),
+            "trials": store.get("trials"),
+            "sr_benchmark": store.get("sr_benchmark"),
+            "baseline_version": store.get("baseline_version"),
+            "counts": counts,
+            "top": [
+                {"id": c["id"], "label": c["label"], "score": c["score"],
+                 "lifecycle": c["lifecycle"], "rank": c["rank"]}
+                for c in store["candidates"][:5]
+            ],
+        }
+    return {
+        "job": strategy_lab.job_snapshot(),
+        "scheduler": strategy_lab.scheduler_snapshot(),
+        "summary": summary,
+    }
+
+
+class ResearchRunRequest(BaseModel):
+    depth: str = "deep"
+
+
+@app.post("/research/run")
+async def research_run(req: ResearchRunRequest,
+                       authorization: Optional[str] = Header(None)):
+    """Start a research job. 409 while one is running (single-job guard)."""
+    _require_auth_or_skip(authorization)
+    try:
+        job = strategy_lab.start_research_job(
+            trigger="operator", depth=req.depth,
+            model=model, feature_names=feature_names, live_version=MODEL_VERSION)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "job": job}
+
+
+@app.get("/research/candidates")
+async def research_candidates(authorization: Optional[str] = Header(None)):
+    """Full ranked candidate store: gates, folds, fee sensitivity, lifecycle."""
+    _require_auth_or_skip(authorization)
+    store = strategy_lab.load_candidates()
+    if not store:
+        return {"available": False}
+    return {"available": True, **store}
+
+
+class ShadowRegisterRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/research/candidates/{cand_id}/shadow")
+async def research_register_shadow(cand_id: str, req: ShadowRegisterRequest,
+                                   authorization: Optional[str] = Header(None)):
+    """Run a deploy-candidate in shadow: register its config as a runtime
+    version and swap it into the existing (evaluation-only) shadow slot."""
+    _require_auth_or_skip(authorization)
+    cand = strategy_lab.get_candidate(cand_id)
+    if cand is None:
+        raise HTTPException(status_code=404, detail=f"Unknown candidate '{cand_id}' — run research first")
+    if cand.get("role") != "candidate":
+        raise HTTPException(status_code=400, detail="Baseline versions use SHADOW_MODEL_VERSION, not lab registration")
+    if cand.get("lifecycle") not in ("DEPLOY_CANDIDATE", "SHADOW_REJECTED", "SHADOW_RUNNING"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only deploy-candidates enter shadow (lifecycle: {cand.get('lifecycle')}). "
+                   "The gates exist so 'deploy-candidate' means something.")
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Shadow registration replaces the current candidate slot — resend with confirm=true")
+
+    version = strategy_lab.shadow_version_name(cand_id)
+    register_version(version, strategy_lab.spec_config(cand))
+
+    # A displaced lab candidate goes back to DEPLOY_CANDIDATE (it was not
+    # rejected — it just lost the single evaluation slot).
+    prev = strategy_lab.read_shadow_registration()
+    if prev and prev.get("candidate_id") not in (None, cand_id):
+        strategy_lab.set_lifecycle(prev["candidate_id"], "DEPLOY_CANDIDATE",
+                                   reason=f"displaced from shadow by {cand_id}")
+
+    reg = strategy_lab.write_shadow_registration(cand, trigger="operator")
+    _activate_shadow(version)
+    strategy_lab.set_lifecycle(cand_id, "SHADOW_RUNNING", reason="operator run-in-shadow")
+    logger.warning(f"SHADOW candidate registered: {cand_id} ({cand['label']}) as {version}")
+    return {
+        "ok": True,
+        "version": version,
+        "registration": reg,
+        "note": "Evaluation-only: the shadow slot computes signals and paper "
+                "trades on the live stream — broker orders come from the "
+                "primary path alone.",
+    }
+
+
+class ShadowStopRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/research/shadow/stop")
+async def research_stop_shadow(req: ShadowStopRequest,
+                               authorization: Optional[str] = Header(None)):
+    """End a lab candidate's shadow evaluation with a SHADOW_REJECTED verdict."""
+    _require_auth_or_skip(authorization)
+    reg = strategy_lab.read_shadow_registration()
+    if not reg:
+        raise HTTPException(status_code=404, detail="No lab candidate is registered in shadow")
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Stopping ends the evaluation (verdict: SHADOW_REJECTED) — resend with confirm=true")
+    strategy_lab.clear_shadow_registration(reason="operator stop")
+    strategy_lab.set_lifecycle(reg["candidate_id"], "SHADOW_REJECTED",
+                               reason="operator stopped shadow evaluation")
+    _deactivate_shadow()
+    return {"ok": True, "candidate": reg["candidate_id"], "verdict": "SHADOW_REJECTED"}
 
 
 @app.get("/trades")
