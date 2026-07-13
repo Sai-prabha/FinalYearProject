@@ -266,3 +266,44 @@ def test_no_refire_when_already_at_target(wire):
     ms._broker_position = 1
     ran = asyncio.run(ms._maybe_auto_execute(1, 1_760_000_000, PRICES))
     assert ran is False and broker.placed == []
+
+
+# ── Shadow isolation ──────────────────────────────────────────────────────
+
+
+class _FakeShadowGen:
+    """Explodes if execution ever consults the shadow candidate."""
+
+    @property
+    def position(self):
+        raise AssertionError("execution path must never read shadow state")
+
+    trades: list = []
+
+
+def test_shadow_cannot_reach_execution(wire, monkeypatch):
+    """The candidate's opinion is structurally invisible to the broker path:
+    execution runs entirely off the primary target, even with a live shadow
+    generator installed."""
+    broker = wire(StubBroker(usdt=5000.0))
+    monkeypatch.setattr(ms, "shadow_signal_gen", _FakeShadowGen())
+    asyncio.run(ms._execute_broker_position_change(0, 1, 1_760_000_000, PRICES))
+    ev = ms._last_execution_event
+    assert ev["outcome"] == "OK" and ms._broker_position == 1
+    # exactly the primary's dual-leg entry — nothing sized or sided by shadow
+    assert {(r.symbol, r.side) for r in broker.placed} == {("BTCUSDT", "BUY"), ("ETHUSDT", "SELL")}
+
+
+def test_demo_execution_works_with_shadow_enabled(wire, monkeypatch):
+    """Enabling the shadow candidate does not change what the broker sees:
+    same legs, same balance-based sizes, shadow file state untouched."""
+    broker = wire(StubBroker(usdt=5000.0))
+
+    class _QuietShadow:
+        position = -1  # candidate disagrees with the primary — must not matter
+        trades: list = []
+
+    monkeypatch.setattr(ms, "shadow_signal_gen", _QuietShadow())
+    asyncio.run(ms._execute_broker_position_change(0, 1, 1_760_000_000, PRICES))
+    assert sorted(r.quantity for r in broker.placed) == [pytest.approx(0.0016), pytest.approx(0.057)]
+    assert all(not r.reduce_only for r in broker.placed)
