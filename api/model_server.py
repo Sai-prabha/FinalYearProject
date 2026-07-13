@@ -123,6 +123,18 @@ WARMUP_CANDLES = 1000
 # ── Version selection ──────────────────────────────────────────────────────
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "v4.15")
 
+# The env-configured version, frozen at boot. /model/promote may move
+# MODEL_VERSION at runtime; a mismatch between the two tells operators the
+# deployment env still needs updating for the promotion to survive a restart.
+CONFIGURED_MODEL_VERSION = MODEL_VERSION
+
+# Data freshness: candles are 1m — a last-processed candle older than this is
+# stale and every client (UI, monitors) gets told so explicitly.
+STALE_AFTER_SECONDS = int(os.environ.get("STALE_AFTER_SECONDS", "180"))
+
+# Append-only audit trail of runtime promotions (who went live, from what, when).
+PROMOTIONS_JSONL = LIVE_DATA_DIR / "promotions.jsonl"
+
 # Shadow candidate version — when set (and different from MODEL_VERSION), a
 # second signal generator runs side-by-side on the exact same probability
 # stream. It persists simulated trades to its own file and NEVER touches the
@@ -908,6 +920,8 @@ async def process_kline_message(data: Dict):
         "data_quality": data_quality,
         "model_info": {
             "version": MODEL_VERSION,
+            "configured_version": CONFIGURED_MODEL_VERSION,
+            "stale_after_s": STALE_AFTER_SECONDS,
             "n_features": len(feature_names),
             "calc_time_ms": round(calc_ms, 1),
             "broker": _broker_summary(),
@@ -1178,6 +1192,28 @@ def _broker_summary() -> Dict:
     }
 
 
+def _freshness() -> Dict:
+    """Data-freshness contract for /status and clients.
+
+    Truth = age of the last fully-processed candle (the older leg of the
+    BTC/ETH pair — a fresh BTC candle can't compensate for a dead ETH feed).
+    `stale` is explicit so no client has to invent its own threshold.
+    """
+    dq = feature_calc.get_data_quality_status() if feature_calc else None
+    last_candle = None
+    if dq:
+        times = [t for t in (dq.get("last_btc_time"), dq.get("last_eth_time")) if t]
+        last_candle = min(times) if times else None
+    age = (datetime.now(timezone.utc).timestamp() - last_candle) if last_candle else None
+    return {
+        "last_candle_ts": last_candle,
+        "age_seconds": round(age, 1) if age is not None else None,
+        "stale_after_seconds": STALE_AFTER_SECONDS,
+        # No candle yet counts as stale — absence of data is never "fresh"
+        "stale": bool(age is None or age > STALE_AFTER_SECONDS),
+    }
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -1268,8 +1304,77 @@ async def version():
     """Return current model version and available versions."""
     return {
         "current": MODEL_VERSION,
+        "configured": CONFIGURED_MODEL_VERSION,
         "available": list_versions(),
     }
+
+
+class PromoteRequest(BaseModel):
+    version: str
+    confirm: bool = False
+
+
+@app.post("/model/promote")
+async def promote_model(req: PromoteRequest, authorization: Optional[str] = Header(None)):
+    """Promote the shadow candidate to live. Deliberate and explicit by design:
+
+    - only the currently-evaluated shadow candidate can be promoted (a version
+      nobody has watched running never goes live by API call),
+    - requires confirm=true,
+    - refuses while any position is open or model/broker are drifted,
+    - carries the live portfolio (balance, pnl, trade history) across the swap,
+    - runtime-only: the env (Railway MODEL_VERSION) must be updated to persist.
+
+    Broker routing is untouched — auto_execute, guards and the kill switch
+    govern execution exactly as before.
+    """
+    _require_auth_or_skip(authorization)
+    global MODEL_VERSION, SHADOW_MODEL_VERSION, signal_gen, shadow_signal_gen
+
+    if shadow_signal_gen is None:
+        raise HTTPException(status_code=400, detail="No shadow candidate configured — nothing to promote")
+    if req.version != SHADOW_MODEL_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only the evaluated shadow candidate ({SHADOW_MODEL_VERSION}) can be promoted",
+        )
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Promotion changes the live strategy — resend with confirm=true")
+    if signal_gen.position != 0 or shadow_signal_gen.position != 0:
+        raise HTTPException(status_code=409, detail="Refusing to promote while a position is open — wait for flat")
+    drift = _broker_summary().get("position_drift") or {}
+    if drift.get("drifted"):
+        raise HTTPException(status_code=409, detail="Refusing to promote while model/broker positions are drifted — reconcile first")
+
+    old_version = MODEL_VERSION
+    new_gen = _make_signal_gen(req.version)
+    # Portfolio continuity: the account outlives the strategy swap
+    for attr in ("balance", "starting_balance", "total_pnl", "wins", "losses", "trades"):
+        if hasattr(signal_gen, attr) and hasattr(new_gen, attr):
+            setattr(new_gen, attr, getattr(signal_gen, attr))
+    signal_gen = new_gen
+    MODEL_VERSION = req.version
+    # The candidate is live now — the shadow slot retires (its trades file
+    # stays on disk as the evaluation record).
+    shadow_signal_gen = None
+    SHADOW_MODEL_VERSION = ""
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "from": old_version,
+        "to": req.version,
+        "configured_env": CONFIGURED_MODEL_VERSION,
+    }
+    _ensure_live_dir()
+    with open(PROMOTIONS_JSONL, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    note = (
+        f"Runtime promotion only — set MODEL_VERSION={req.version} and unset/rotate "
+        f"SHADOW_MODEL_VERSION in the deployment env (Railway) to persist across restarts."
+    )
+    logger.warning(f"MODEL PROMOTED {old_version} → {req.version} (runtime). {note}")
+    return {"ok": True, "from": old_version, "to": req.version, "persisted": False, "note": note}
 
 
 @app.get("/status")
@@ -1278,8 +1383,10 @@ async def status():
         "data_quality": feature_calc.get_data_quality_status() if feature_calc else None,
         "latest_signal": latest_signal_data.get("signal"),
         "last_update": latest_signal_data.get("timestamp"),
+        "freshness": _freshness(),
         "active_clients": len(active_connections),
         "model_version": MODEL_VERSION,
+        "configured_version": CONFIGURED_MODEL_VERSION,
         "n_features": len(feature_names),
         "broker": _broker_summary(),
         "last_exec": _last_execution_event,
