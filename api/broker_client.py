@@ -141,6 +141,22 @@ class BrokerClient(ABC):
     @abstractmethod
     def get_balance(self) -> dict: ...
 
+    def try_get_open_positions(self) -> Optional[list[dict]]:
+        """Like ``get_open_positions`` but None when the exchange truth is
+        unavailable (query error, or a broker with no exchange behind it).
+
+        Callers use None to mean "fall back to internally tracked state" —
+        an empty list is a *positive* statement that the account is flat.
+        """
+        return None
+
+    def get_symbol_filters(self, symbol: str) -> Optional[dict]:
+        """Exchange trading filters for one symbol, or None when unknown.
+
+        Shape: ``{"step_size": float, "min_qty": float, "min_notional": float}``.
+        """
+        return None
+
     @abstractmethod
     def get_order_status(self, symbol: str, order_id: str) -> Optional[dict]:
         """Return fill info for a submitted order, or None if unavailable.
@@ -477,6 +493,59 @@ class BinanceFuturesBroker(BrokerClient):
             )
         self._log_interaction("get_open_positions", {}, result)
         return result
+
+    def try_get_open_positions(self) -> Optional[list[dict]]:
+        """Positions with error visibility: [] means confirmed flat, None means
+        the query failed and the caller must not assume anything."""
+        _, body = self._signed_request("GET", "/fapi/v2/positionRisk", {})
+        if not isinstance(body, list):
+            self._log_interaction("try_get_open_positions", {}, body, error="non-list response")
+            return None
+        result: list[dict] = []
+        for p in body:
+            try:
+                size = float(p.get("positionAmt", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if size == 0.0:
+                continue
+            result.append(
+                {
+                    "symbol": p.get("symbol", ""),
+                    "side": "LONG" if size > 0 else "SHORT",
+                    "size": abs(size),
+                    "signed_size": size,
+                    "entry_price": float(p.get("entryPrice", 0.0) or 0.0),
+                    "mark_price": float(p.get("markPrice", 0.0) or 0.0),
+                }
+            )
+        return result
+
+    _filters_cache: Optional[dict] = None
+
+    def get_symbol_filters(self, symbol: str) -> Optional[dict]:
+        """Market-order filters from /fapi/v1/exchangeInfo, cached for the
+        process lifetime (filters change ~never). None on fetch failure."""
+        if self._filters_cache is None:
+            try:
+                resp = self._session.get(f"{self._base_url}/fapi/v1/exchangeInfo", timeout=15)
+                resp.raise_for_status()
+                cache: dict = {}
+                for s in resp.json().get("symbols", []):
+                    fs = {f.get("filterType"): f for f in s.get("filters", [])}
+                    lot = fs.get("MARKET_LOT_SIZE") or fs.get("LOT_SIZE") or {}
+                    notional = fs.get("MIN_NOTIONAL") or {}
+                    cache[s.get("symbol", "")] = {
+                        "step_size": float(lot.get("stepSize", 0.0) or 0.0),
+                        "min_qty": float(lot.get("minQty", 0.0) or 0.0),
+                        "min_notional": float(notional.get("notional", 0.0) or 0.0),
+                    }
+                self._filters_cache = cache
+                logger.info(f"Exchange filters cached for {len(cache)} symbols")
+            except Exception as e:
+                logger.warning(f"exchangeInfo fetch failed (filters unavailable): {e}")
+                return None
+        return self._filters_cache.get(symbol.upper())
 
     def get_balance(self) -> dict:
         _, body = self._signed_request("GET", "/fapi/v2/balance", {})

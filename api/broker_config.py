@@ -48,9 +48,16 @@ class BrokerConfig(BaseModel):
     auto_execute: bool = False
     default_symbol: str = "BTCUSDT"
     default_qty: float = Field(default=0.001, gt=0, le=100.0)
-    # Per-leg sizes used by the dual-leg auto-execute path
+    # Per-leg sizes used by the dual-leg auto-execute path when
+    # sizing_mode == "fixed", and as the fallback when balance sizing
+    # cannot resolve an equity figure (paper mode, balance query failure).
     default_btc_qty: float = Field(default=0.001, gt=0, le=1.0)
     default_eth_qty: float = Field(default=0.05, gt=0, le=20.0)
+    # "balance": each auto-exec entry leg targets (USDT wallet balance ×
+    # risk_fraction) of notional, normalized through exchange filters and
+    # capped by the safety rails. "fixed": always default_*_qty.
+    sizing_mode: str = Field(default="balance", pattern="^(balance|fixed)$")
+    risk_fraction: float = Field(default=0.02, gt=0, le=0.2)
 
 
 def _defaults_from_env() -> BrokerConfig:

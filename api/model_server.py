@@ -18,6 +18,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ from .broker_client import (
     BrokerClient,
     OrderRequest,
     OrderResponse,
+    _safety_limits,
     make_broker_client,
 )
 from .broker_config import (
@@ -354,6 +356,223 @@ def _check_and_persist_new_trades():
         _last_trade_count = current_count
 
 
+# ── Broker-aware sizing and transition planning ───────────────────────────
+
+# Serializes auto-exec transitions. BTC and ETH klines both close on the same
+# minute boundary, and each closed candle runs the full handler — without this
+# lock the two ticks race and submit duplicate legs (same client_id, seconds
+# apart), one of which then rejects with -2022 or double-fills.
+_exec_lock = asyncio.Lock()
+
+# Testnet USDM filters snapshot (2026-07) — used only when the live
+# exchangeInfo fetch is unavailable (paper mode, network failure).
+_FALLBACK_FILTERS = {
+    "BTCUSDT": {"step_size": 0.0001, "min_qty": 0.0001, "min_notional": 50.0},
+    "ETHUSDT": {"step_size": 0.001, "min_qty": 0.001, "min_notional": 20.0},
+}
+
+_EXEC_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+
+
+def _floor_step(qty: float, step: float) -> float:
+    """Floor a quantity to the exchange step size (never round up)."""
+    if step <= 0:
+        return qty
+    return round(math.floor(qty / step + 1e-9) * step, 8)
+
+
+def _symbol_filters(symbol: str) -> dict:
+    live = broker_client.get_symbol_filters(symbol) if broker_client else None
+    return live or _FALLBACK_FILTERS.get(symbol, {"step_size": 0.0, "min_qty": 0.0, "min_notional": 0.0})
+
+
+def _fixed_qty(symbol: str) -> float:
+    return broker_config.default_btc_qty if symbol == "BTCUSDT" else broker_config.default_eth_qty
+
+
+def _size_legs(prices: dict) -> dict:
+    """Compute the target entry quantity per symbol. Blocking (balance query) —
+    call via ``asyncio.to_thread``.
+
+    Sizing basis is the USDT *wallet balance* of the demo account, not
+    availableBalance: cross-margin inflates available with other assets'
+    collateral, so wallet balance is the conservative, stable equity figure.
+    target notional = equity × risk_fraction; qty = notional / candle close,
+    floored to the exchange step, clamped by the safety caps and the guard
+    max-notional. Below minQty/minNotional → the leg is not tradable ("skip").
+
+    Returns ``{symbol: {"qty", "skip", "sizing": {...}}}``. Falls back to the
+    configured fixed sizes whenever an equity figure cannot be resolved
+    (paper broker, balance query failure, sizing_mode="fixed") — trading never
+    silently stops because sizing data is missing.
+    """
+    basis, equity = "fixed", None
+    if broker_config.sizing_mode == "balance":
+        try:
+            bal = broker_client.get_balance()
+            usdt = next((a for a in bal.get("assets", []) if a.get("asset") == "USDT"), None)
+            wallet = float(usdt.get("balance", 0.0) or 0.0) if usdt else 0.0
+            if wallet > 0:
+                equity, basis = wallet, "balance"
+            else:
+                basis = "fixed-fallback"
+        except Exception as e:
+            logger.warning(f"Balance sizing unavailable ({e}); using fixed leg sizes")
+            basis = "fixed-fallback"
+
+    limits = _safety_limits()
+    out: dict = {}
+    for symbol in _EXEC_SYMBOLS:
+        price = float(prices.get(symbol) or 0.0)
+        filters = _symbol_filters(symbol)
+        raw = _fixed_qty(symbol)
+        clamped_by = None
+        if basis == "balance" and price > 0:
+            raw = (equity * broker_config.risk_fraction) / price
+        qty = raw
+        cap = limits["max_qty"].get(symbol, limits["default_max_qty"])
+        if qty > cap:
+            qty, clamped_by = cap, f"safety cap {cap}"
+        if execution_guards is not None and price > 0 and qty * price > execution_guards.max_notional_usdt:
+            qty = execution_guards.max_notional_usdt / price
+            clamped_by = f"max notional {execution_guards.max_notional_usdt:g} USDT"
+        qty = _floor_step(qty, filters["step_size"])
+        skip = None
+        if qty < filters["min_qty"]:
+            skip = f"below exchange min qty ({filters['min_qty']:g})"
+        elif price > 0 and qty * price < filters["min_notional"]:
+            skip = f"below exchange min notional ({filters['min_notional']:g} USDT)"
+        out[symbol] = {
+            "qty": qty,
+            "skip": skip,
+            "sizing": {
+                "basis": basis,
+                "equity": equity,
+                "risk_fraction": broker_config.risk_fraction if basis == "balance" else None,
+                "price": price or None,
+                "raw_qty": round(raw, 8),
+                "clamped_by": clamped_by,
+            },
+        }
+    return out
+
+
+def _target_exposure(pos: int, sized: dict) -> dict:
+    """Signed target exposure per symbol for a model position.
+    LONG ratio = long BTC + short ETH; SHORT ratio = the reverse."""
+    if pos == 0:
+        return {}
+    sign = 1 if pos > 0 else -1
+    return {
+        "BTCUSDT": sign * sized["BTCUSDT"]["qty"],
+        "ETHUSDT": -sign * sized["ETHUSDT"]["qty"],
+    }
+
+
+def _assumed_exposure(pos: int) -> dict:
+    """Exposure implied by the internally tracked position, at fixed sizes.
+    Used only when the exchange cannot be queried (paper mode / API failure)."""
+    if pos == 0:
+        return {}
+    sign = 1 if pos > 0 else -1
+    return {
+        "BTCUSDT": sign * broker_config.default_btc_qty,
+        "ETHUSDT": -sign * broker_config.default_eth_qty,
+    }
+
+
+def _skipped_leg(symbol: str, side: str, qty: float, kind: str, reason: str, sizing: Optional[dict] = None) -> dict:
+    """A leg the planner decided NOT to send. kind: "satisfied" (exchange
+    already at target) | "not-tradable" (below exchange thresholds) |
+    "drift" (position the model expected is not on the exchange)."""
+    leg = {
+        "symbol": symbol, "side": side, "qty": qty, "reduce_only": False,
+        "status": "SKIPPED", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0,
+        "error": None, "skip_kind": kind, "skip_reason": reason,
+    }
+    if sizing:
+        leg["sizing"] = sizing
+    return leg
+
+
+async def _plan_transition(prev_pos: int, new_pos: int, sized: dict) -> dict:
+    """Plan only the legs actually required to move the *real* broker state to
+    the target exposure.
+
+    Queries live positions first: exits are sized to the actual exchange
+    position (never the configured default), a reduce-only order is never sent
+    for a symbol the exchange holds no position in, and entries are skipped
+    when the exchange already has same-side exposure (another writer, a
+    previous partial fill). When the exchange cannot be queried the planner
+    falls back to the internally tracked exposure — identical to the old
+    behavior, so paper mode is unchanged.
+    """
+    actual = None
+    if broker_client is not None:
+        actual = await asyncio.to_thread(broker_client.try_get_open_positions)
+    if actual is None:
+        current = _assumed_exposure(prev_pos)
+        source = "model-assumed"
+    else:
+        current = {}
+        for p in actual:
+            if p.get("symbol") in _EXEC_SYMBOLS:
+                signed = p.get("signed_size")
+                if signed is None:
+                    signed = p.get("size", 0.0) * (1 if p.get("side") == "LONG" else -1)
+                current[p["symbol"]] = float(signed)
+        source = "exchange"
+
+    target = _target_exposure(new_pos, sized)
+    exits: list = []
+    entries: list = []
+    skipped: list = []
+    for symbol in _EXEC_SYMBOLS:
+        cur = current.get(symbol, 0.0)
+        tgt = target.get(symbol, 0.0)
+        same_side = cur != 0 and tgt != 0 and (cur > 0) == (tgt > 0)
+        if cur != 0 and not same_side:
+            exits.append({
+                "symbol": symbol,
+                "side": "SELL" if cur > 0 else "BUY",
+                "qty": _floor_step(abs(cur), _symbol_filters(symbol)["step_size"]),
+                "reduce_only": True,
+            })
+        if tgt != 0:
+            side = "BUY" if tgt > 0 else "SELL"
+            if same_side:
+                # ponytail: same-side exposure satisfies the target — no resize
+                # churn; sizes re-converge on the next full exit/entry cycle.
+                skipped.append(_skipped_leg(
+                    symbol, side, abs(tgt), "satisfied",
+                    f"already {'LONG' if cur > 0 else 'SHORT'} {abs(cur):g} {symbol} on exchange — target satisfied",
+                ))
+            elif sized[symbol]["skip"]:
+                skipped.append(_skipped_leg(
+                    symbol, side, 0.0, "not-tradable", sized[symbol]["skip"],
+                    sizing=sized[symbol]["sizing"],
+                ))
+            else:
+                entries.append({
+                    "symbol": symbol, "side": side, "qty": abs(tgt),
+                    "reduce_only": False, "sizing": sized[symbol]["sizing"],
+                })
+
+    # The model expected exposure that the exchange does not have (closed by
+    # another writer / manual close). That is drift to reconcile, not a
+    # broker failure — record it so operators can see it.
+    if source == "exchange" and prev_pos != 0:
+        expected = _assumed_exposure(prev_pos)
+        for symbol, exp in expected.items():
+            if current.get(symbol, 0.0) == 0.0:
+                skipped.append(_skipped_leg(
+                    symbol, "SELL" if exp > 0 else "BUY", 0.0, "drift",
+                    f"no {symbol} position on exchange to reduce — reconciled without an order",
+                ))
+
+    return {"exits": exits, "entries": entries, "skipped": skipped, "source": source}
+
+
 async def _place_leg_order(
     symbol: str,
     side: str,
@@ -393,38 +612,18 @@ async def _place_leg_order(
         return {**base, "status": "ERROR", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0, "error": str(e)}
 
 
-async def _place_entry_orders(direction: int, timestamp: int) -> list:
-    """Place dual-leg MARKET entry orders for a new ratio position.
-
-    LONG  ratio (BTC/ETH up)  → BUY  BTCUSDT + SELL ETHUSDT
-    SHORT ratio (BTC/ETH down) → SELL BTCUSDT + BUY  ETHUSDT
-    Returns list of per-leg result dicts.
-    """
-    btc_side = "BUY" if direction == 1 else "SELL"
-    eth_side = "SELL" if direction == 1 else "BUY"
-    label = "L" if direction == 1 else "S"
-    tag = f"{timestamp}-{label}"
-
-    btc = await _place_leg_order("BTCUSDT", btc_side, broker_config.default_btc_qty, False, tag)
-    eth = await _place_leg_order("ETHUSDT", eth_side, broker_config.default_eth_qty, False, tag)
-    return [btc, eth]
-
-
-async def _place_exit_orders(direction: int, timestamp: int) -> list:
-    """Place reduce-only MARKET exit orders to close an existing ratio position.
-
-    Closes LONG  → SELL BTCUSDT + BUY  ETHUSDT (reduce_only)
-    Closes SHORT → BUY  BTCUSDT + SELL ETHUSDT (reduce_only)
-    Returns list of per-leg result dicts.
-    """
-    btc_side = "SELL" if direction == 1 else "BUY"
-    eth_side = "BUY" if direction == 1 else "SELL"
-    label = "XL" if direction == 1 else "XS"
-    tag = f"{timestamp}-{label}"
-
-    btc = await _place_leg_order("BTCUSDT", btc_side, broker_config.default_btc_qty, True, tag)
-    eth = await _place_leg_order("ETHUSDT", eth_side, broker_config.default_eth_qty, True, tag)
-    return [btc, eth]
+async def _place_planned_legs(specs: list, timestamp: int, label: str) -> list:
+    """Submit planner leg specs sequentially; carry sizing detail onto results."""
+    results = []
+    for spec in specs:
+        r = await _place_leg_order(
+            spec["symbol"], spec["side"], spec["qty"], spec["reduce_only"],
+            tag=f"{timestamp}-{label}",
+        )
+        if spec.get("sizing"):
+            r["sizing"] = spec["sizing"]
+        results.append(r)
+    return results
 
 
 _TERMINAL_STATUSES = {"FILLED", "REJECTED", "ERROR", "CANCELED", "EXPIRED"}
@@ -449,6 +648,10 @@ async def _unwind_one_leg(leg: dict) -> dict:
     return result
 
 
+# Outcomes that mean "nothing went wrong" — no true broker failure occurred.
+_BENIGN_OUTCOMES = frozenset({"OK", "RECONCILED", "SKIPPED"})
+
+
 def _build_exec_event(
     prev_pos: int,
     new_pos: int,
@@ -457,17 +660,24 @@ def _build_exec_event(
     entry_legs: list,
     unwind_legs: list,
     outcome: str,
+    skipped_legs: Optional[list] = None,
+    exposure_source: Optional[str] = None,
 ) -> dict:
     """Build the execution event dict stored in ``_last_execution_event``.
 
-    ``outcome`` is one of: "OK" | "EXIT_PARTIAL_FAILURE" | "ENTRY_ALL_REJECTED"
+    ``outcome`` is one of: "OK" | "RECONCILED" | "SKIPPED"
+      | "EXIT_PARTIAL_FAILURE" | "ENTRY_ALL_REJECTED"
       | "ENTRY_PARTIAL_UNWIND_OK" | "ENTRY_PARTIAL_UNWIND_FAILED".
+    "RECONCILED": the exchange already matched the target (or the expected
+    position was gone) — state advanced without sending any order.
+    "SKIPPED": the intended entry was not tradable (below exchange minimums).
 
-    The flat ``legs`` list (exit + entry + unwind) is kept for backward
-    compatibility with ``_reconcile_legs`` and WS consumers.
+    The flat ``legs`` list (exit + entry + unwind + skipped) is kept for
+    backward compatibility with ``_reconcile_legs`` and WS consumers.
     """
     _pl = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
-    all_legs = exit_legs + entry_legs + unwind_legs
+    skipped_legs = skipped_legs or []
+    all_legs = exit_legs + entry_legs + unwind_legs + skipped_legs
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "prev_pos": prev_pos,
@@ -475,11 +685,13 @@ def _build_exec_event(
         "final_pos": final_pos,
         "transition": f"{_pl.get(prev_pos, '?')}→{_pl.get(new_pos, '?')}",
         "outcome": outcome,
-        "all_ok": outcome == "OK",
+        "all_ok": outcome in _BENIGN_OUTCOMES,
         "legs": all_legs,
         "exit_legs": exit_legs,
         "entry_legs": entry_legs,
         "unwind_legs": unwind_legs,
+        "skipped_legs": skipped_legs,
+        "exposure_source": exposure_source,
         "reconciled": False,
     }
 
@@ -532,7 +744,7 @@ async def _reconcile_and_broadcast() -> None:
     await _reconcile_legs(legs)
     # all_ok reflects the outcome determined at execution time; reconciliation
     # only updates fill details, it does not override a partial-failure outcome.
-    _last_execution_event["all_ok"] = _last_execution_event.get("outcome") == "OK"
+    _last_execution_event["all_ok"] = _last_execution_event.get("outcome") in _BENIGN_OUTCOMES
     _last_execution_event["reconciled"] = True
     _persist_exec_event(_last_execution_event)
     # Broadcast a lightweight message so the frontend doesn't wait for the next candle
@@ -565,43 +777,73 @@ def _auto_exec_eligible() -> bool:
     )
 
 
-async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp: int) -> None:
+async def _maybe_auto_execute(target_pos: int, timestamp: int, prices: dict) -> bool:
+    """Serialize transition execution across candle ticks.
+
+    BTC and ETH candles close on the same minute boundary and each closed
+    candle runs the full handler; only one may execute a transition. A tick
+    that arrives mid-execution is skipped (not queued) — the next candle
+    re-checks drift and retries if still needed. Drift is re-checked under
+    the lock so a tick queued behind a completed execution never re-fires.
+    Returns True if an execution actually ran.
+    """
+    if _exec_lock.locked():
+        logger.info(
+            "AUTO-EXEC SKIPPED [in-flight]: %d→%d — execution already running",
+            _broker_position, target_pos,
+        )
+        return False
+    async with _exec_lock:
+        if target_pos == _broker_position:
+            return False
+        await _execute_broker_position_change(_broker_position, target_pos, timestamp, prices)
+        return True
+
+
+async def _execute_broker_position_change(
+    prev_pos: int, new_pos: int, timestamp: int, prices: Optional[dict] = None
+) -> None:
     """Execute broker orders for a model position transition with leg-sync safety.
 
     Staged flow:
-      Step 1 — Exit the previous position (if any).
+      Step 0 — Size the target legs (balance-based unless configured fixed)
+               and plan the transition against *actual* broker positions:
+               exits only for real exchange exposure (at its real size),
+               entries only where the exchange is not already positioned.
+      Step 1 — Submit planned exit legs.
                If any exit leg is rejected/errored, abort immediately and keep
                _broker_position = prev_pos so the next signal tick retries.
-      Step 2 — Enter the new position (if any).
+      Step 2 — Submit planned entry legs (if any).
                If ALL entry legs fail:  stay flat (final_pos = 0).
                If SOME entry legs fill and SOME fail (partial entry):
                  fire reduce-only MARKET orders to unwind the filled leg(s),
                  then stay flat (final_pos = 0).
                If ALL entry legs succeed: advance to new_pos.
+      No orders needed — exchange already matches the target (drift healed or
+      another writer got there first): advance state, outcome "RECONCILED".
+      Entry not tradable (below exchange minimums): outcome "SKIPPED".
 
-    ``_broker_position`` is only advanced to new_pos when all legs succeed.
-    In all failure/partial cases it is left at a consistent known-safe value
-    so the next position-change trigger will re-attempt the right transition
-    without an explicit retry loop.
-
-    Outcomes stored in ``_last_execution_event.outcome``:
-      "OK"                         — all legs filled, position advanced
-      "EXIT_PARTIAL_FAILURE"       — exit failed; old position may still be open
-      "ENTRY_ALL_REJECTED"         — all entry legs rejected; stayed flat
-      "ENTRY_PARTIAL_UNWIND_OK"    — partial entry; unwind succeeded; stayed flat
-      "ENTRY_PARTIAL_UNWIND_FAILED"— partial entry; unwind failed; manual fix needed
+    ``_broker_position`` is only advanced to new_pos when the exchange
+    verifiably matches it. In failure cases it is left at a consistent
+    known-safe value so the next tick re-attempts the right transition.
     """
     global _broker_position, _last_execution_event
 
     _pl = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
-    exit_legs: list = []
     entry_legs: list = []
     unwind_legs: list = []
     final_pos = prev_pos  # conservative default — only advanced on confirmed success
 
-    # ── Step 1: Exit previous position ───────────────────────────────────────
-    if prev_pos != 0:
-        exit_legs = await _place_exit_orders(prev_pos, timestamp)
+    # ── Step 0: Size and plan against real broker state ─────────────────────
+    sized = await asyncio.to_thread(_size_legs, prices or {})
+    plan = await _plan_transition(prev_pos, new_pos, sized)
+    skipped_legs = plan["skipped"]
+
+    # ── Step 1: Submit planned exit legs ─────────────────────────────────────
+    exit_legs: list = []
+    if plan["exits"]:
+        label = "XL" if prev_pos == 1 else "XS" if prev_pos == -1 else "X"
+        exit_legs = await _place_planned_legs(plan["exits"], timestamp, label)
         exit_failures = [l for l in exit_legs if l["status"] in _FAILED_STATUSES]
 
         if exit_failures:
@@ -618,19 +860,21 @@ async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp
             )
             _broker_position = prev_pos
             _last_execution_event = _build_exec_event(
-                prev_pos, new_pos, prev_pos, exit_legs, [], [], "EXIT_PARTIAL_FAILURE"
+                prev_pos, new_pos, prev_pos, exit_legs, [], [], "EXIT_PARTIAL_FAILURE",
+                skipped_legs, plan["source"],
             )
             _persist_exec_event(_last_execution_event)
             await broadcast_to_clients({"type": "exec_event", "last_exec": _last_execution_event})
             asyncio.create_task(_reconcile_and_broadcast())
             return
 
-        # All exit legs accepted — old position is closed (fills confirmed async)
-        final_pos = 0
+    # All exit legs accepted (or none were needed) — previous exposure is gone
+    final_pos = 0
 
-    # ── Step 2: Enter new position ────────────────────────────────────────────
-    if new_pos != 0:
-        entry_legs = await _place_entry_orders(new_pos, timestamp)
+    # ── Step 2: Submit planned entry legs ─────────────────────────────────────
+    if plan["entries"]:
+        label = "L" if new_pos == 1 else "S"
+        entry_legs = await _place_planned_legs(plan["entries"], timestamp, label)
         entry_failures = [l for l in entry_legs if l["status"] in _FAILED_STATUSES]
         entry_filled   = [l for l in entry_legs if l["status"] not in _FAILED_STATUSES]
 
@@ -677,21 +921,47 @@ async def _execute_broker_position_change(prev_pos: int, new_pos: int, timestamp
             final_pos = new_pos
 
     else:
-        # Exit-only (new_pos == 0) with all exits succeeding
-        outcome = "OK"
-        final_pos = 0
+        # No entry orders were needed.
+        not_tradable = [l for l in skipped_legs if l.get("skip_kind") == "not-tradable"]
+        if new_pos != 0 and not_tradable:
+            # The intended entry is below exchange minimums — nothing was sent.
+            # Stay flat; the model will re-attempt when sizing becomes tradable.
+            outcome = "SKIPPED"
+            final_pos = 0
+            logger.warning(
+                "ENTRY SKIPPED [%s→%s]: %s",
+                _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"),
+                "; ".join(l["skip_reason"] for l in not_tradable),
+            )
+        elif new_pos != 0:
+            # Target exposure already on the exchange (another writer / earlier
+            # partial) — nothing to send, state converges without orders.
+            outcome = "RECONCILED"
+            final_pos = new_pos
+        elif not exit_legs and prev_pos != 0:
+            # Model expected a position; exchange is already flat — drift healed.
+            outcome = "RECONCILED"
+            final_pos = 0
+        else:
+            # Exit-only (new_pos == 0) with all exits succeeding
+            outcome = "OK"
+            final_pos = 0
 
     _broker_position = final_pos
     _last_execution_event = _build_exec_event(
-        prev_pos, new_pos, final_pos, exit_legs, entry_legs, unwind_legs, outcome
+        prev_pos, new_pos, final_pos, exit_legs, entry_legs, unwind_legs, outcome,
+        skipped_legs, plan["source"],
     )
     _persist_exec_event(_last_execution_event)
     logger.info(
-        "AUTO-EXEC [%s] %s→%s confirmed→%s (%d exit / %d entry / %d unwind legs): %s",
+        "AUTO-EXEC [%s] %s→%s confirmed→%s (%d exit / %d entry / %d unwind / %d skipped legs): %s",
         outcome,
         _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"), _pl.get(final_pos, "?"),
-        len(exit_legs), len(entry_legs), len(unwind_legs),
-        ", ".join(f"{l['symbol']} {l['side']} {l['status']}" for l in exit_legs + entry_legs + unwind_legs),
+        len(exit_legs), len(entry_legs), len(unwind_legs), len(skipped_legs),
+        ", ".join(
+            f"{l['symbol']} {l['side']} {l['status']}"
+            for l in exit_legs + entry_legs + unwind_legs + skipped_legs
+        ),
     )
     # Background reconciliation enriches fill details then re-broadcasts
     asyncio.create_task(_reconcile_and_broadcast())
@@ -889,8 +1159,9 @@ async def process_kline_message(data: Dict):
                         guard.reason, _broker_position, _post_update_pos,
                     )
             if not blocked:
-                await _execute_broker_position_change(
-                    _broker_position, _post_update_pos, candle["time"]
+                await _maybe_auto_execute(
+                    _post_update_pos, candle["time"],
+                    prices={"BTCUSDT": btc_close, "ETHUSDT": eth_close},
                 )
     # Build ALL features for frontend display & export (all 50)
     feature_values = {}
@@ -1177,6 +1448,8 @@ def _broker_summary() -> Dict:
         "default_qty": broker_config.default_qty if broker_config is not None else 0.001,
         "default_btc_qty": broker_config.default_btc_qty if broker_config is not None else 0.001,
         "default_eth_qty": broker_config.default_eth_qty if broker_config is not None else 0.05,
+        "sizing_mode": broker_config.sizing_mode if broker_config is not None else "fixed",
+        "risk_fraction": broker_config.risk_fraction if broker_config is not None else None,
         "guards": execution_guards.to_dict() if execution_guards is not None else None,
         "kill_switch": kill_switch.to_dict() if kill_switch is not None else None,
         # Model vs broker position (-1/0/+1). Drift means the broker was never
@@ -1558,6 +1831,8 @@ class BrokerConfigUpdate(BaseModel):
     """Partial update payload for POST /broker/config."""
 
     auto_execute: Optional[bool] = None
+    sizing_mode: Optional[str] = None
+    risk_fraction: Optional[float] = None
     default_symbol: Optional[str] = None
     default_qty: Optional[float] = None
     default_btc_qty: Optional[float] = None
