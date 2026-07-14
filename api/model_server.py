@@ -41,7 +41,7 @@ from xgboost import XGBClassifier
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .trade_stats import compute_trade_stats
 from .version_config import get_strategy_config, list_versions, register_version
-from . import execution_control, ops_audit, reconciliation, simulation_lab, strategy_lab, timing_advisor
+from . import execution_control, microstructure_ingest, ops_audit, reconciliation, simulation_lab, strategy_lab, timing_advisor
 from .broker_client import (
     JSONL_LOG_PATH,
     BrokerClient,
@@ -1597,6 +1597,13 @@ async def lifespan(app: FastAPI):
     # 6. Reconciliation sync loop — read-only broker history ingest (demo
     # only; the paper broker has no exchange history behind it).
     recon_task = asyncio.create_task(_recon_sync_loop())
+
+    # 7. Microstructure ingestion — read-only PUBLIC market data (L2 + tape),
+    # keyless, no broker path (MICROSTRUCTURE.md). Off unless enabled().
+    micro_started = False
+    if microstructure_ingest.enabled():
+        microstructure_ingest.start_microstructure_ingestion()
+        micro_started = True
     logger.info("=" * 80)
     logger.info(f"{version.upper()} MODEL SERVER - READY")
     logger.info("=" * 80)
@@ -1611,6 +1618,8 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    if micro_started:
+        await microstructure_ingest.stop_microstructure_ingestion()
 
 
 # ── Auth helpers ────────────────────────────────────────────────────────────
@@ -1924,6 +1933,7 @@ async def status():
         "broker": _broker_summary(),
         "last_exec": _last_execution_event,
         "shadow": _shadow_snapshot(),
+        "microstructure": microstructure_ingest.status_snapshot(),
     }
 
 
