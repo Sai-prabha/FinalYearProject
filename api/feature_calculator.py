@@ -1101,6 +1101,12 @@ class V416SignalGenerator:
         # Volatility tracking
         self._recent_returns: deque = deque(maxlen=30)
 
+        # Toxic-vol regime filter state (config-gated; default off).
+        # Ratio 1m log returns; window sized to the percentile lookback so the
+        # filter is self-normalizing against its own recent history.
+        self._vf_returns: deque = deque(maxlen=cfg.vol_filter_pct_window)
+        self._vf_last_ratio: float = 0.0
+
         # ── V4.16 live-hardening state ──
         # Directional bias breaker: track recent trade directions
         self._recent_directions: deque = deque(maxlen=cfg.direction_bias_lookback)
@@ -1123,6 +1129,43 @@ class V416SignalGenerator:
             return 0.001
         arr = np.array(self._recent_returns)
         return float(np.std(arr)) if np.std(arr) > 1e-8 else 0.001
+
+    # ── Toxic-vol regime filter (entries only; parity with eval_v4183_regime) ──
+
+    def _vol_filter_update(self, current_ratio: float) -> None:
+        """Track 1m ratio log returns for the regime filter (always cheap)."""
+        if self._vf_last_ratio > 0 and current_ratio > 0:
+            self._vf_returns.append(float(np.log(current_ratio / self._vf_last_ratio)))
+        self._vf_last_ratio = current_ratio
+
+    def _vol_regime_toxic(self) -> bool:
+        """True when trailing RV(window) exceeds its own trailing quantile.
+
+        Conservative on unknown regime: with insufficient history (< 4×window
+        for the percentile base, matching the offline evaluation's
+        min_periods) the regime is treated as toxic and entries are blocked.
+        ddof=1 std + linear-interpolation quantile match the pandas defaults
+        used by scripts/eval_v4183_regime.py so live == backtest.
+        """
+        if not self.cfg.vol_filter_enabled:
+            return False
+        w = self.cfg.vol_filter_window
+        if len(self._vf_returns) < 4 * w:
+            return True
+        arr = np.asarray(self._vf_returns, dtype=float)
+        rv = float(np.std(arr[-w:], ddof=1))
+        return rv > self._vf_quantile(arr, w)
+
+    def _vf_quantile(self, arr: np.ndarray, w: int) -> float:
+        """Trailing quantile of the rolling RV series, computed like pandas
+        rolling(std).rolling(quantile) — approximated by the quantile of RV
+        over strided sub-windows to stay O(window) per bar."""
+        # RV series over the retained history, stride 30 bars keeps this cheap
+        # while tracking the same distribution the offline evaluator used.
+        rvs = []
+        for end in range(w, len(arr) + 1, 30):
+            rvs.append(np.std(arr[end - w:end], ddof=1))
+        return float(np.quantile(np.asarray(rvs), self.cfg.vol_filter_quantile))
 
     # ── Time-of-day filter ───────────────────────────────────────────────
 
@@ -1430,6 +1473,9 @@ class V416SignalGenerator:
             blocked.append(f"Cooldown ({self.bars_since_change}/{self.cooldown})")
 
         # V4.16 safeguards
+        if self.position == 0 and self._vol_regime_toxic():
+            blocked.append("Toxic-vol regime")
+
         if (self.cfg.direction_bias_enabled
                 and len(self._recent_directions) >= self.cfg.direction_bias_lookback
                 and len(set(self._recent_directions)) == 1):
@@ -1453,6 +1499,9 @@ class V416SignalGenerator:
             )
         elif len(self._recent_returns) == 0:
             self._recent_returns.append(0.0)
+
+        # Regime filter bookkeeping (cheap; gating applied at entry only)
+        self._vol_filter_update(current_ratio)
 
         prev = self.position
         desired = prev
@@ -1494,7 +1543,9 @@ class V416SignalGenerator:
 
         # ── Hysteresis logic (asymmetric-aware) ──
         if prev == 0:
-            if proba_up >= self._long_thr:
+            if self._vol_regime_toxic():
+                pass  # toxic-vol regime: no new entries; exits unaffected by construction
+            elif proba_up >= self._long_thr:
                 desired = 1
             elif proba_up <= self._short_thr:
                 desired = -1

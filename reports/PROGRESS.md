@@ -207,3 +207,18 @@ shadow accounting (`stats_net`, `SHADOW_FEE_BPS_PER_SIDE`, runtime/cost identity
 `/shadow/status`), the experiment ledger, and Meridian's net-expectancy comparison rows.
 Remaining credible paths: new feature/architecture family; honest maker-fill simulation
 (limit-through, not a fee discount). Sizing stays untouched until an edge exists.
+
+## Addendum — H3 regime gate: GATE FAILED, but first material holdout improvement (2026-07-14, later)
+
+Pre-registered (`V4183_NEXT_CANDIDATE.md`): maker tactics REJECTED WITHOUT TRIAL (bounded above
+by the 2 bps sensitivity + negative-drift literature); microstructure features REJECTED (no L2
+history — not backtestable); H_regime evaluated. Trend-block variants disqualified on tune
+(n=10/8 — "wins by never trading" caught by the n-floor). **V2 toxic-vol block** (entries blocked
+when RV240 > trailing-30d p90, self-normalizing, frozen pre-evaluation) selected on tune, one
+holdout shot: **n=61, −0.034%/trade net, −$7.52, DD −2.5%** — gate FAILED (expectancy ≤ 0,
+third consecutive refusal, no v4.18.3) but **strictly dominates incumbent v4.18 on holdout**
+(−0.085%/−$22/−3.7%), satisfying this file's ratchet. Shipped as `vol_filter_enabled` in
+`StrategyConfig` (default OFF; `V416SignalGenerator` entries-only, exits untouched, blocked_by
+"Toxic-vol regime"; stride-quantile live semantics verified identical to 4 d.p. on holdout).
+Enabling on the demo default = operator decision (bleed reduction, NOT edge). Next credible
+hypothesis: fit/meta-label on calm-regime bars only (conditional fitting, not just gating).

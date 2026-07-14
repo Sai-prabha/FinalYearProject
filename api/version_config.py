@@ -86,6 +86,18 @@ class StrategyConfig:
     entry_threshold_short: float | None = None
     max_hold_bars: int = 0          # Force-exit position after N bars (0 = disabled)
 
+    # --- Toxic-vol regime entry filter (H_regime V2, 2026-07-14) ---
+    # Blocks NEW entries when trailing RV(vol_filter_window) exceeds its own
+    # trailing vol_filter_pct_window quantile. Self-normalizing (no absolute
+    # vol constant). Exits are never blocked. Evidence: strictly dominates
+    # the unfiltered incumbent on holdout2026 (V4183_NEXT_CANDIDATE.md) but
+    # does NOT make expectancy positive — default OFF; enabling it on the
+    # demo default is a deliberate operator decision, not a promotion.
+    vol_filter_enabled: bool = False
+    vol_filter_window: int = 240
+    vol_filter_pct_window: int = 43_200
+    vol_filter_quantile: float = 0.90
+
 
 # ── V4.15 configuration (frozen baseline) ─────────────────────────────────
 
