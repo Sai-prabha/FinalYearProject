@@ -1,0 +1,169 @@
+{
+  "pre_registration": "V4183_CALM_META_OPTUNA.md",
+  "anchor_v418_calm_tune": {
+    "n_trades": 50,
+    "win_rate_pct": 36.0,
+    "expectancy_pct": -0.1157,
+    "avg_win_pct": 0.5069,
+    "avg_loss_pct": -0.4659,
+    "win_loss_ratio": 1.088,
+    "profit_factor": 0.605,
+    "total_pnl_dollar": -20.49,
+    "final_equity": 979.51,
+    "max_drawdown_pct": -2.457,
+    "sharpe": -4.8,
+    "sortino": -5.08,
+    "avg_bars_held": 159.9,
+    "long_n": 0,
+    "long_avg_pct": null,
+    "short_n": 50,
+    "short_avg_pct": -0.1157,
+    "exit_reasons": {
+      "Max hold": {
+        "n": 26,
+        "avg_pct": 0.2039
+      },
+      "Signal change": {
+        "n": 17,
+        "avg_pct": -0.5063
+      },
+      "Stop loss": {
+        "n": 6,
+        "avg_pct": -0.6897
+      },
+      "Take profit": {
+        "n": 1,
+        "avg_pct": 1.6605
+      }
+    }
+  },
+  "ha_best_trial": {
+    "number": 3,
+    "value": -0.1201,
+    "params": {
+      "max_depth": 4,
+      "n_estimators": 60,
+      "learning_rate": 0.02434058776747757,
+      "min_child_weight": 3,
+      "subsample": 0.6137554084460873,
+      "colsample_bytree": 0.9637281608315128,
+      "reg_lambda": 1.085551727188307,
+      "short_q": 0.02
+    },
+    "attrs": {
+      "blocked_meta": 0,
+      "blocked_vol": 12659,
+      "exp_h1": -0.0743,
+      "exp_h2": -0.1201,
+      "max_dd_pct": -1.603,
+      "n": 42,
+      "n_h1": 14,
+      "n_h2": 28,
+      "thr": 0.4398
+    }
+  },
+  "hb_results": [
+    {
+      "cutoff": 0.4,
+      "score": 0.0407,
+      "n": 18,
+      "n_h1": 11,
+      "n_h2": 7,
+      "max_dd_pct": -0.63,
+      "exp_h1": 0.0407,
+      "exp_h2": 0.0873,
+      "blocked_vol": 12874,
+      "blocked_meta": 247
+    },
+    {
+      "cutoff": 0.45,
+      "score": 0.0667,
+      "n": 16,
+      "n_h1": 9,
+      "n_h2": 7,
+      "max_dd_pct": -0.527,
+      "exp_h1": 0.0667,
+      "exp_h2": 0.0873,
+      "blocked_vol": 12874,
+      "blocked_meta": 260
+    },
+    {
+      "cutoff": 0.5,
+      "score": -1002.0,
+      "n": 13,
+      "n_h1": 7,
+      "n_h2": 6,
+      "max_dd_pct": -0.561,
+      "blocked_vol": 12874,
+      "blocked_meta": 289
+    },
+    {
+      "cutoff": 0.55,
+      "score": -1005.0,
+      "n": 10,
+      "n_h1": 6,
+      "n_h2": 4,
+      "max_dd_pct": -0.94,
+      "blocked_vol": 12909,
+      "blocked_meta": 306
+    },
+    {
+      "cutoff": 0.6,
+      "score": -1006.0,
+      "n": 9,
+      "n_h1": 5,
+      "n_h2": 4,
+      "max_dd_pct": -0.595,
+      "blocked_vol": 12909,
+      "blocked_meta": 326
+    }
+  ],
+  "winner": "H_B",
+  "holdout": {
+    "n_trades": 26,
+    "win_rate_pct": 26.92,
+    "expectancy_pct": -0.1752,
+    "avg_win_pct": 0.3456,
+    "avg_loss_pct": -0.367,
+    "win_loss_ratio": 0.942,
+    "profit_factor": 0.347,
+    "total_pnl_dollar": -16.16,
+    "final_equity": 983.84,
+    "max_drawdown_pct": -1.685,
+    "sharpe": -12.08,
+    "sortino": -11.07,
+    "avg_bars_held": 143.0,
+    "long_n": 0,
+    "long_avg_pct": null,
+    "short_n": 26,
+    "short_avg_pct": -0.1752,
+    "exit_reasons": {
+      "Max hold": {
+        "n": 13,
+        "avg_pct": 0.0906
+      },
+      "Signal change": {
+        "n": 12,
+        "avg_pct": -0.4556
+      },
+      "Stop loss": {
+        "n": 1,
+        "avg_pct": -0.2654
+      }
+    },
+    "blocked_vol": 30591,
+    "blocked_meta": 261
+  },
+  "gate": {
+    "selected": "H_B",
+    "config": {
+      "cutoff": 0.45
+    },
+    "holdout_net_exp_pos": false,
+    "holdout_pnl_beats_v418": true,
+    "holdout_n_ge_20": true,
+    "holdout_dd_floor": true,
+    "top1_removed_sign_ok": true
+  },
+  "verdict": "GATE FAILED \u2014 v4.18.3 not activated"
+}

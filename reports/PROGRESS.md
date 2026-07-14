@@ -222,3 +222,19 @@ third consecutive refusal, no v4.18.3) but **strictly dominates incumbent v4.18 
 "Toxic-vol regime"; stride-quantile live semantics verified identical to 4 d.p. on holdout).
 Enabling on the demo default = operator decision (bleed reduction, NOT edge). Next credible
 hypothesis: fit/meta-label on calm-regime bars only (conditional fitting, not just gating).
+
+## Addendum — H4 conditional fitting + disciplined Optuna: GATE FAILED; hypothesis space now closed (2026-07-14, later still)
+
+Pre-registered (`V4183_CALM_META_OPTUNA.md`): frozen 8-dim search space, TPE seed 42, 40 trials,
+no pruner, min-over-two-tune-halves net-expectancy objective, holdout sealed inside the study.
+**H_A (retrain on 315K calm bars, 240-bar labels):** best of 40 hyperparameter configs =
+−0.12%/trade min-half on TUNE — the whole space is negative on the selection window; the deficit
+is information, not hyperparameters; never reached the holdout. **H_B (3-feature logit
+meta-acceptance over 178 train trades):** tune-positive (+0.067% min-half, n=16, cutoff 0.45)
+→ ONE holdout shot: **n=26, −0.175%/trade, PF 0.35, −$16.16** — inverted OOS (small-sample
+meta-labeling failure, as the literature warned). Gate FAILED (fourth consecutive refusal);
+no weights persisted; ledger `v4.18.3-h4-calm-fit`. Harness anchor reproduced H3 to 4 s.f.
+**Every family reachable with 1m-kline data is now evidence-closed** (decision layer, horizon
+retrains, execution tactics, regime gating, conditional fitting, meta-labeling). Further
+candidates require NEW information (order-flow capture going forward, alt data) or a cost-
+structure change — not more fitting. Optuna stays research-only (never in api/requirements.txt).
