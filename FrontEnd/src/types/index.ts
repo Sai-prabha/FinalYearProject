@@ -144,6 +144,25 @@ export interface BrokerExecEvent {
   reconciled?: boolean;    // true once all legs have been reconciled
 }
 
+export interface ExecutionWriterInfo {
+  backend: string; // 'railway' | 'local'
+  instance_id: string;
+  is_writer: boolean;
+  role: 'writer' | 'observer';
+}
+
+/** Backend-authoritative shared auto-execute state (GET/PATCH /execution/control). */
+export interface ExecutionControlState {
+  auto_execute: boolean;
+  version: number;
+  updated_at: string | null;
+  updated_by: string | null;
+  updated_via: string | null;
+  request_id: string | null;
+  writer: ExecutionWriterInfo;
+  mode: string;
+}
+
 export interface BrokerConfigSummary {
   mode: 'paper' | 'demo' | 'unknown';
   auto_execute: boolean;

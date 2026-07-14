@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { THEME_COLORS } from '../constants';
+import { MODEL_SERVER_REST_URL, THEME_COLORS } from '../constants';
 import { useBrokerConfig } from '../hooks/useBrokerConfig';
+import { useExecutionControl } from '../hooks/useExecutionControl';
+import { isCanonicalBackend } from '../services/executionControl';
 import { useBrokerBalance } from '../hooks/useBrokerBalance';
 import { useBrokerPositions } from '../hooks/useBrokerPositions';
 import { placeOrder, placeTestOrder } from '../services/brokerApi';
@@ -121,9 +123,107 @@ const Header: React.FC<{ config: BrokerConfigSummary }> = ({ config }) => {
   );
 };
 
-// ── Auto-execute row ─────────────────────────────────────────────────────
+// ── Auto-execute row (shared control plane) ──────────────────────────────
+// Two-way view over the backend-owned /execution/control resource. The
+// switch renders backend truth only, writes are explicit SETs with a version
+// precondition, and a 409 refreshes to the authoritative value instead of
+// silently racing another surface (Meridian, API). See EXECUTION_CONTROL.md.
 
 const AutoExecuteRow: React.FC<{
+  config: BrokerConfigSummary;
+  update: ReturnType<typeof useBrokerConfig>['update'];
+}> = ({ config, update }) => {
+  const { control, supported, loading, pending, notice, set } = useExecutionControl();
+  if (!supported) return <LegacyAutoExecuteRow config={config} update={update} />;
+
+  const isOn = control?.auto_execute ?? false; // backend truth, never local
+  const disabled = loading || pending || !control;
+  const canonical = isCanonicalBackend();
+  let host = MODEL_SERVER_REST_URL;
+  try {
+    host = new URL(MODEL_SERVER_REST_URL).host;
+  } catch { /* keep raw */ }
+
+  return (
+    <div className="pt-2">
+      <div
+        className="flex items-center justify-between px-2 py-1.5 rounded"
+        style={{
+          backgroundColor: isOn ? `${THEME_COLORS.POSITIVE}22` : THEME_COLORS.CARD_BG_LIGHT,
+        }}
+      >
+        <div>
+          <div
+            className="text-[11px] font-semibold tracking-wide"
+            style={{ color: isOn ? THEME_COLORS.POSITIVE : THEME_COLORS.TEXT_SECONDARY }}
+          >
+            AUTO EXECUTE: {loading ? '…' : isOn ? 'ON' : 'OFF'}
+            {pending ? ' · SAVING' : ''}
+          </div>
+          <div className="text-[10px]" style={{ color: THEME_COLORS.TEXT_SECONDARY }}>
+            Shared operational control — one backend-owned state for all surfaces
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => control && void set(!control.auto_execute)}
+          disabled={disabled}
+          aria-pressed={isOn}
+          aria-busy={pending}
+          className="rounded-full transition-colors"
+          style={{
+            width: 32,
+            height: 18,
+            backgroundColor: isOn ? THEME_COLORS.POSITIVE : THEME_COLORS.BORDER,
+            opacity: disabled ? 0.5 : 1,
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            position: 'relative',
+          }}
+        >
+          <span
+            style={{
+              position: 'absolute',
+              top: 2,
+              left: isOn ? 16 : 2,
+              width: 14,
+              height: 14,
+              borderRadius: '50%',
+              backgroundColor: '#fff',
+              transition: 'left 0.15s ease',
+            }}
+          />
+        </button>
+      </div>
+      {control && (
+        <div className="mt-1 px-2 text-[10px] leading-relaxed" style={{ color: THEME_COLORS.TEXT_SECONDARY }}>
+          Controlled by {control.writer.backend} · {control.writer.role} · instance{' '}
+          {control.writer.instance_id}
+          <br />
+          {control.updated_at
+            ? `Last change ${new Date(control.updated_at).toLocaleString()} by ${control.updated_by ?? 'unknown'} via ${control.updated_via ?? 'unknown'} · v${control.version}`
+            : 'Never changed via control plane'}
+        </div>
+      )}
+      {!canonical && (
+        <div className="mt-1 px-2 text-[10px]" style={{ color: THEME_COLORS.YELLOW }}>
+          Non-canonical backend ({host}) — this switch controls that backend, not Railway
+        </div>
+      )}
+      {control && !control.writer.is_writer && (
+        <div className="mt-1 px-2 text-[10px]" style={{ color: THEME_COLORS.YELLOW }}>
+          This backend is an observer — auto-execute here never places broker orders;
+          Railway is the execution writer
+        </div>
+      )}
+      {notice && (
+        <div className="mt-1 px-2 text-[10px]" style={{ color: THEME_COLORS.YELLOW }}>{notice}</div>
+      )}
+    </div>
+  );
+};
+
+// Fallback for a backend that predates /execution/control (legacy toggle).
+const LegacyAutoExecuteRow: React.FC<{
   config: BrokerConfigSummary;
   update: ReturnType<typeof useBrokerConfig>['update'];
 }> = ({ config, update }) => {

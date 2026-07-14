@@ -27,7 +27,15 @@ def test_auto_exec_eligible_in_paper_and_demo(monkeypatch):
     monkeypatch.setattr(ms, "broker_client", paper)
     assert ms._auto_exec_eligible() is True  # THE incident: this was False
 
+    # demo (real testnet orders) additionally requires writer status — a
+    # non-writer instance must never place broker orders (EXECUTION_CONTROL.md)
     monkeypatch.setattr(paper, "mode", "demo", raising=False)
+    monkeypatch.delenv("EXECUTION_WRITER", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("RAILWAY_PROJECT_ID", raising=False)
+    monkeypatch.setattr(ms, "_non_writer_warned", False)
+    assert ms._auto_exec_eligible() is False
+    monkeypatch.setenv("EXECUTION_WRITER", "1")
     assert ms._auto_exec_eligible() is True
 
     monkeypatch.setattr(ms, "broker_config", BrokerConfig(auto_execute=False))

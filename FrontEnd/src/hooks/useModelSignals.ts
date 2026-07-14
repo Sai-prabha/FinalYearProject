@@ -61,6 +61,13 @@ export const useModelSignals = (): UseModelSignalsReturn => {
             return;
           }
 
+          // Only full signal snapshots may replace signalData — event-style
+          // broadcasts (e.g. type "exec_reconciled" after an auto-execute
+          // reconciliation) have no `signal` and would crash consumers.
+          if (!data.signal) {
+            return;
+          }
+
           setSignalData(data as ModelSignalData);
           
           // Log significant signals

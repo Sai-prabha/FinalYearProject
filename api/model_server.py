@@ -41,7 +41,7 @@ from xgboost import XGBClassifier
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .trade_stats import compute_trade_stats
 from .version_config import get_strategy_config, list_versions, register_version
-from . import strategy_lab
+from . import execution_control, strategy_lab
 from .broker_client import (
     JSONL_LOG_PATH,
     BrokerClient,
@@ -807,12 +807,31 @@ def _auto_exec_eligible() -> bool:
     execution trace. (The incident this fixes: paper mode used to skip the
     block silently while the UI said "auto-execute ON".)
     """
-    return (
+    if not (
         broker_client is not None
         and broker_config is not None
         and broker_client.mode in ("demo", "paper")
         and broker_config.auto_execute
-    )
+    ):
+        return False
+    # Demo mode places real testnet orders — only the designated writer
+    # instance may do that. Paper is simulated fills (no broker), so the
+    # rehearsal path stays available on any instance.
+    if broker_client.mode == "demo" and not execution_control.is_writer():
+        global _non_writer_warned
+        if not _non_writer_warned:
+            logger.warning(
+                "AUTO-EXEC BLOCKED: this instance (%s) is not the execution "
+                "writer — auto_execute is on but demo orders are refused. "
+                "Set EXECUTION_WRITER=1 only on the canonical instance.",
+                execution_control.instance_id(),
+            )
+            _non_writer_warned = True
+        return False
+    return True
+
+
+_non_writer_warned = False
 
 
 async def _maybe_auto_execute(target_pos: int, timestamp: int, prices: dict) -> bool:
@@ -1492,6 +1511,8 @@ def _broker_summary() -> Dict:
         "default_eth_qty": broker_config.default_eth_qty if broker_config is not None else 0.05,
         "sizing_mode": broker_config.sizing_mode if broker_config is not None else "fixed",
         "risk_fraction": broker_config.risk_fraction if broker_config is not None else None,
+        # Which instance is allowed to place broker orders (see EXECUTION_CONTROL.md)
+        "writer": execution_control.writer_info(),
         "guards": execution_guards.to_dict() if execution_guards is not None else None,
         "kill_switch": kill_switch.to_dict() if kill_switch is not None else None,
         # Model vs broker position (-1/0/+1). Drift means the broker was never
@@ -2031,6 +2052,96 @@ async def features_importance(authorization: Optional[str] = Header(None)):
         return {"features": [], "error": str(e)}
 
 
+# ── Execution control plane ───────────────────────────────────────────────
+# Backend-authoritative shared auto-execute state. Explicit SET semantics,
+# integer-version optimistic concurrency, append-only audit. Both frontends
+# and the legacy /broker/config path route through _set_auto_execute so no
+# write can bypass versioning or audit. See EXECUTION_CONTROL.md.
+
+
+class ExecutionControlPatch(BaseModel):
+    auto_execute: bool
+    expected_version: Optional[int] = None
+    request_id: Optional[str] = None
+
+
+def _control_actor(authorization: Optional[str]) -> str:
+    token = _get_token_from_request(authorization)
+    username = _verify_jwt(token) if token else None
+    return username or "anonymous"
+
+
+def _execution_control_state() -> Dict:
+    return execution_control.control_state(
+        auto_execute=broker_config.auto_execute if broker_config is not None else False,
+        mode=broker_client.mode if broker_client is not None else "unknown",
+    )
+
+
+def _set_auto_execute(
+    desired: bool,
+    actor: str,
+    via: str,
+    expected_version: Optional[int] = None,
+    request_id: Optional[str] = None,
+) -> Dict:
+    """The single mutation path for auto_execute.
+
+    Idempotent (same value → no-op, no version bump) and conflict-checked
+    (stale expected_version → 409 with the authoritative state embedded).
+    Returns the fresh control state.
+    """
+    global broker_config
+    if broker_config is None:
+        raise HTTPException(status_code=503, detail="Broker config not initialized")
+    with execution_control.LOCK:
+        meta = execution_control.load_meta()
+        if expected_version is not None and expected_version != meta["version"]:
+            execution_control.audit_conflict(
+                expected_version, meta["version"], desired, actor, via, request_id
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "stale version — state changed elsewhere",
+                    "current": _execution_control_state(),
+                },
+            )
+        prev = broker_config.auto_execute
+        if desired == prev:
+            return _execution_control_state()  # idempotent no-op
+        new_cfg = apply_partial_update(broker_config, {"auto_execute": desired})
+        save_broker_config(new_cfg)
+        broker_config = new_cfg
+        execution_control.commit_change(prev, desired, actor, via, request_id)
+        return _execution_control_state()
+
+
+@app.get("/execution/control")
+async def get_execution_control(authorization: Optional[str] = Header(None)):
+    """Authoritative shared auto-execute state + writer identity."""
+    _require_auth_or_skip(authorization)
+    return _execution_control_state()
+
+
+@app.patch("/execution/control")
+async def patch_execution_control(
+    patch: ExecutionControlPatch,
+    authorization: Optional[str] = Header(None),
+    x_control_surface: Optional[str] = Header(None),
+):
+    """Explicit SET of the shared auto-execute state (never a toggle)."""
+    _require_auth_or_skip(authorization)
+    via = (x_control_surface or "api").strip().lower()[:32] or "api"
+    return _set_auto_execute(
+        desired=patch.auto_execute,
+        actor=_control_actor(authorization),
+        via=via,
+        expected_version=patch.expected_version,
+        request_id=patch.request_id,
+    )
+
+
 # ── Broker control ────────────────────────────────────────────────────────
 
 
@@ -2070,14 +2181,21 @@ async def update_broker_config_route(
     if broker_config is None:
         raise HTTPException(status_code=503, detail="Broker config not initialized")
 
-    try:
-        new_cfg = apply_partial_update(broker_config, update.model_dump(exclude_none=True))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid broker config: {e}")
+    partial = update.model_dump(exclude_none=True)
+    # auto_execute is the shared operational control — route it through the
+    # control plane so legacy writes stay versioned and audited.
+    auto_execute = partial.pop("auto_execute", None)
+    if auto_execute is not None:
+        _set_auto_execute(auto_execute, actor=_control_actor(authorization), via="legacy-api")
 
-    save_broker_config(new_cfg)
-    broker_config = new_cfg
-    logger.info(f"Broker config updated: {new_cfg.model_dump()}")
+    if partial:
+        try:
+            new_cfg = apply_partial_update(broker_config, partial)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid broker config: {e}")
+        save_broker_config(new_cfg)
+        broker_config = new_cfg
+        logger.info(f"Broker config updated: {new_cfg.model_dump()}")
     return _broker_summary()
 
 
