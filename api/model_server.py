@@ -175,6 +175,7 @@ _SERVER_STARTED_TS = time.time()
 
 # Shadow candidate generator (None unless SHADOW_MODEL_VERSION is set)
 shadow_signal_gen = None  # V414SignalGenerator | V416SignalGenerator
+shadow_model = None  # XGBClassifier with the shadow's OWN weights, or None (shares primary)
 _shadow_last_trade_count: int = 0
 _last_shadow_signal: Optional[Dict] = None
 
@@ -304,12 +305,33 @@ def _activate_shadow(version: str) -> None:
     counters. Used at boot (env or lab registration) and by the run-in-shadow
     endpoint. The slot stays evaluation-only — nothing here touches the broker."""
     global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
-    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON, shadow_model
     SHADOW_MODEL_VERSION = version
     SHADOW_TRADES_JSON = LIVE_DATA_DIR / f"shadow_{version.replace('.', '_')}_trades.json"
     shadow_signal_gen = _make_signal_gen(version)
     _shadow_last_trade_count = 0
     _last_shadow_signal = None
+    # Dual-model shadow: a candidate with its OWN weights ships them under
+    # models/<version with dots→underscores>/. When present (and trained on
+    # the identical feature set), the slot gets its own probability stream;
+    # otherwise it shares the primary's (decision-layer-only candidates).
+    shadow_model = None
+    shadow_dir = Path(__file__).resolve().parent.parent / "models" / version.replace(".", "_")
+    if (shadow_dir / "model.json").exists():
+        try:
+            fn_path = shadow_dir / "feature_names.json"
+            shadow_features = json.loads(fn_path.read_text()) if fn_path.exists() else None
+            if shadow_features != feature_names:
+                logger.warning(
+                    "  SHADOW model %s feature set differs from primary — "
+                    "own-weights disabled, sharing primary probas", version)
+            else:
+                m = XGBClassifier()
+                m.load_model(str(shadow_dir / "model.json"))
+                shadow_model = m
+                logger.info(f"  SHADOW own weights loaded: {shadow_dir / 'model.json'}")
+        except Exception as e:
+            logger.warning(f"  SHADOW model load failed ({e}); sharing primary probas")
     if SHADOW_TRADES_JSON.exists():
         try:
             with open(SHADOW_TRADES_JSON, "r") as f:
@@ -328,12 +350,43 @@ def _activate_shadow(version: str) -> None:
 def _deactivate_shadow() -> None:
     """Empty the shadow slot (stop endpoint / promotion)."""
     global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
-    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON, shadow_model
+    shadow_model = None
     shadow_signal_gen = None
     SHADOW_MODEL_VERSION = ""
     SHADOW_TRADES_JSON = None
     _shadow_last_trade_count = 0
     _last_shadow_signal = None
+
+
+# Broker-realistic cost model for shadow accounting: a ratio round trip is
+# 4 taker MARKET fills. Keeps the candidate comparison honest — shadow PnL
+# is reported net of the costs it WOULD have paid, not internal-ledger gross.
+SHADOW_FEE_BPS_PER_SIDE = float(os.environ.get("SHADOW_FEE_BPS_PER_SIDE", "4.5"))
+_SHADOW_RT_COST = 4 * SHADOW_FEE_BPS_PER_SIDE / 10_000.0
+
+
+def _apply_cost_model(trade: Dict) -> Dict:
+    """Stamp net-of-cost fields onto a closed trade dict (idempotent)."""
+    if "pnl_pct_net" in trade:
+        return trade
+    pnl_pct = float(trade.get("pnl_pct", 0.0) or 0.0)
+    pnl_dollar = float(trade.get("pnl_dollar", 0.0) or 0.0)
+    notional = abs(pnl_dollar / (pnl_pct / 100.0)) if pnl_pct else 0.0
+    fee = notional * _SHADOW_RT_COST
+    trade["fee_dollar"] = round(fee, 6)
+    trade["pnl_pct_net"] = round(pnl_pct - _SHADOW_RT_COST * 100.0, 6)
+    trade["pnl_dollar_net"] = round(pnl_dollar - fee, 6)
+    return trade
+
+
+def _net_view(trades: list) -> list:
+    """Trades with pnl fields replaced by their net-of-cost values, for stats."""
+    out = []
+    for t in trades:
+        t = _apply_cost_model(dict(t))
+        out.append({**t, "pnl_pct": t["pnl_pct_net"], "pnl_dollar": t["pnl_dollar_net"]})
+    return out
 
 
 def _check_and_persist_shadow_trades():
@@ -352,7 +405,7 @@ def _check_and_persist_shadow_trades():
                 existing = json.load(f)
         except Exception:
             existing = []
-    existing.extend(shadow_signal_gen.trades[_shadow_last_trade_count:])
+    existing.extend(_apply_cost_model(t) for t in shadow_signal_gen.trades[_shadow_last_trade_count:])
     with open(SHADOW_TRADES_JSON, "w") as f:
         json.dump(_sanitize_for_json(existing), f, indent=2, default=str)
     _shadow_last_trade_count = current
@@ -1256,17 +1309,22 @@ async def process_kline_message(data: Dict):
     # Persist new trades to disk
     _check_and_persist_new_trades()
 
-    # Shadow candidate: same proba/ratio/timestamp, isolated state, own file,
+    # Shadow candidate: same ratio/timestamp, isolated state, own file,
     # no broker interaction. Runs AFTER the primary path so a shadow bug can
-    # never affect the live signal.
+    # never affect the live signal. A shadow with its own weights (dual-model
+    # slot) predicts on the SAME feature vector; otherwise it shares proba_up.
     if shadow_signal_gen is not None:
         global _last_shadow_signal
         try:
-            shadow_sig = shadow_signal_gen.update(proba_up, current_ratio, candle["time"])
+            shadow_proba = proba_up
+            if shadow_model is not None:
+                shadow_proba = float(shadow_model.predict_proba(features_df)[:, 1][0])
+            shadow_sig = shadow_signal_gen.update(shadow_proba, current_ratio, candle["time"])
             _last_shadow_signal = {
                 "direction": shadow_sig["direction"],
                 "triggered": shadow_sig["triggered"],
                 "probability": shadow_sig["probability"],
+                "own_model": shadow_model is not None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             _check_and_persist_shadow_trades()
@@ -1898,6 +1956,10 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
             "win_rate": (wins / closed) if closed else 0.0,
             "recent_trades": trades[-20:],
             "stats": compute_trade_stats(trades, getattr(gen, "starting_balance", 1000.0)),
+            # Broker-realistic lens: the same stats engine over net-of-cost
+            # trades (taker fee model) — the comparison that actually decides
+            # promotion. Gross stats stay for continuity; net is the truth.
+            "stats_net": compute_trade_stats(_net_view(trades), getattr(gen, "starting_balance", 1000.0)),
             # Degradation lens: same engine over only the last 20 closed trades,
             # so recent form can be compared against lifetime honestly (n is
             # reported; small-sample metrics stay suppressed).
@@ -1957,6 +2019,15 @@ async def shadow_status(authorization: Optional[str] = Header(None)):
         "last_shadow_signal": _last_shadow_signal,
         "candidate": candidate,
         "readiness": readiness,
+        # Runtime identity of the comparison: the shadow slot never writes to
+        # the broker, and a dual-model candidate runs its own weights.
+        "runtime_mode": "shadow-only — no broker writes",
+        "shadow_own_model": shadow_model is not None,
+        "cost_model": {
+            "fee_bps_per_side": SHADOW_FEE_BPS_PER_SIDE,
+            "fills_per_round_trip": 4,
+            "round_trip_pct": round(_SHADOW_RT_COST * 100, 4),
+        },
     })
 
 

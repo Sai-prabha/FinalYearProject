@@ -1,0 +1,56 @@
+{
+  "gate": {
+    "selected": {
+      "short_thr": 0.4464,
+      "long_thr": 1.01
+    },
+    "holdout_net_exp_pos": false,
+    "holdout_pnl_beats_v418": false,
+    "holdout_n_ge_20": true,
+    "holdout_dd_floor": true,
+    "top1_removed_sign_ok": true
+  },
+  "verdict": "GATE FAILED \u2014 v4.18.3 not activated",
+  "holdout2026": {
+    "n_trades": 104,
+    "win_rate_pct": 21.15,
+    "expectancy_pct": -0.2006,
+    "avg_win_pct": 0.4947,
+    "avg_loss_pct": -0.3871,
+    "win_loss_ratio": 1.278,
+    "profit_factor": 0.359,
+    "total_pnl_dollar": -57.88,
+    "final_equity": 942.12,
+    "max_drawdown_pct": -5.923,
+    "sharpe": -10.32,
+    "sortino": -10.43,
+    "avg_bars_held": 154.7,
+    "long_n": 0,
+    "long_avg_pct": null,
+    "short_n": 104,
+    "short_avg_pct": -0.2006,
+    "exit_reasons": {
+      "Max hold": {
+        "n": 44,
+        "avg_pct": 0.051
+      },
+      "Signal change": {
+        "n": 53,
+        "avg_pct": -0.3961
+      },
+      "Stop loss": {
+        "n": 5,
+        "avg_pct": -1.087
+      },
+      "Take profit": {
+        "n": 2,
+        "avg_pct": 1.6611
+      }
+    }
+  },
+  "train": {
+    "end": "2025-12-15 minus 240 bars",
+    "auc_in_sample": 0.5971,
+    "samples": 456241
+  }
+}

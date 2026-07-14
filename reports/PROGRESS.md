@@ -190,3 +190,20 @@ Baseline comparison note: v4.18 is NOT underperforming v4.15 — net-of-fees v4.
   Auto-exec now runs in paper too (identical guard/kill-switch/leg/event flow, legs labeled paper);
   `_broker_summary()` exposes `position_drift`; drift self-heals via the every-candle position check.
   Tests: `tests/test_incident_paper_routing.py` (4), suite 52/52 + auto-exec e2e green.
+
+## Addendum — v4.18.3 candidate: both retrain paths evaluated, GATE FAILED (2026-07-14)
+
+The two "credible paths" recorded above were executed under a pre-registered protocol
+(`V4183_CANDIDATE.md`, gate frozen before training; ledger `reports/experiments.jsonl`):
+- **H1 — 240-bar labels, Feb→Oct 2025 train:** AUC_in 0.61 but holdout2026 net exp −0.243%
+  (n=36, PF 0.42) — worse than incumbent v4.18 (−0.085%). REJECTED.
+- **H2 — 240-bar labels, train through 2025-12, deterministic threshold rule:** holdout2026
+  net exp −0.201% (n=104, PF 0.36). REJECTED. Rejected weights deleted.
+
+**The ratchet stands: v4.18 remains the best honest config; no version bump.** Shipped anyway
+(applies to all future candidates): dual-model shadow slot (a candidate with its own weights
+under `models/<ver>/` gets its own proba stream; feature-set mismatch refuses load), net-of-cost
+shadow accounting (`stats_net`, `SHADOW_FEE_BPS_PER_SIDE`, runtime/cost identity in
+`/shadow/status`), the experiment ledger, and Meridian's net-expectancy comparison rows.
+Remaining credible paths: new feature/architecture family; honest maker-fill simulation
+(limit-through, not a fee discount). Sizing stays untouched until an edge exists.

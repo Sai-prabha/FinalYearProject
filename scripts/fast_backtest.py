@@ -109,11 +109,13 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
 # ── Vectorized features + batch predict ──────────────────────────────────
 
 def compute_probas(btc: pd.DataFrame, eth: pd.DataFrame,
-                   model: XGBClassifier, feature_names: list) -> pd.DataFrame:
+                   model: XGBClassifier, feature_names: list,
+                   return_frame: bool = False):
     """Full-frame replica of V414FeatureCalculator.calculate_features().
 
     Returns DataFrame(time, ratio, proba, valid) for every aligned candle.
     Reuses the calculator's static helpers so the math stays single-sourced.
+    With return_frame=True also returns the raw feature frame (training use).
     """
     merged = pd.merge(btc, eth, on="time", suffixes=("_btc", "_eth"), how="inner")
     merged = merged.sort_values("time").reset_index(drop=True)
@@ -166,8 +168,11 @@ def compute_probas(btc: pd.DataFrame, eth: pd.DataFrame,
         "valid": valid.to_numpy(),
     })
     # Only real candles count as tradeable bars (gap-filled rows are synthetic)
-    out = out[out["time"].isin(orig_times)].reset_index(drop=True)
-    return out
+    keep = out["time"].isin(orig_times)
+    out2 = out[keep].reset_index(drop=True)
+    if return_frame:
+        return out2, frame[keep.to_numpy()].reset_index(drop=True)
+    return out2
 
 
 def parity_check(btc: pd.DataFrame, eth: pd.DataFrame, cached: pd.DataFrame,
