@@ -41,7 +41,7 @@ from xgboost import XGBClassifier
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .trade_stats import compute_trade_stats
 from .version_config import get_strategy_config, list_versions, register_version
-from . import execution_control, ops_audit, simulation_lab, strategy_lab, timing_advisor
+from . import execution_control, ops_audit, reconciliation, simulation_lab, strategy_lab, timing_advisor
 from .broker_client import (
     JSONL_LOG_PATH,
     BrokerClient,
@@ -117,6 +117,8 @@ TRADE_HISTORY_CSV = LIVE_DATA_DIR / "trade_history.csv"
 # Append-only log of auto-execute events (one row on submit, one on
 # reconcile). Read back by GET /broker/executions, deduped by timestamp.
 EXEC_EVENTS_JSONL = LIVE_DATA_DIR / "exec_events.jsonl"
+# Broker history cache + sync cursor (reconciliation ingest — read-only).
+_recon_store = reconciliation.BrokerHistoryStore(LIVE_DATA_DIR)
 
 # ── Data API ──────────────────────────────────────────────────────────────
 REST_BASE = "https://api.binance.com/api/v3"
@@ -575,6 +577,9 @@ async def _plan_transition(prev_pos: int, new_pos: int, sized: dict) -> dict:
                 "side": "SELL" if cur > 0 else "BUY",
                 "qty": _floor_step(abs(cur), _symbol_filters(symbol)["step_size"]),
                 "reduce_only": True,
+                # Decision price = signal candle close; reconciliation measures
+                # exit slippage against it (entries carry it inside sizing).
+                "decision_price": sized[symbol]["sizing"].get("price"),
             })
         if tgt != 0:
             side = "BUY" if tgt > 0 else "SELL"
@@ -594,6 +599,7 @@ async def _plan_transition(prev_pos: int, new_pos: int, sized: dict) -> dict:
                 entries.append({
                     "symbol": symbol, "side": side, "qty": abs(tgt),
                     "reduce_only": False, "sizing": sized[symbol]["sizing"],
+                    "decision_price": sized[symbol]["sizing"].get("price"),
                 })
 
     # The model expected exposure that the exchange does not have (closed by
@@ -632,7 +638,9 @@ async def _place_leg_order(
         reduce_only=reduce_only,
         client_id=client_id,
     )
-    base = {"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only}
+    # client_id is persisted on the leg so reconciliation can trace any
+    # broker order back to the exact signal candle + intent that caused it.
+    base = {"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only, "client_id": client_id}
     try:
         resp = await asyncio.to_thread(broker_client.place_order, req)
         if resp.status == "REJECTED":
@@ -660,6 +668,8 @@ async def _place_planned_legs(specs: list, timestamp: int, label: str) -> list:
         )
         if spec.get("sizing"):
             r["sizing"] = spec["sizing"]
+        if spec.get("decision_price") is not None:
+            r["decision_price"] = spec["decision_price"]
         results.append(r)
     return results
 
@@ -700,6 +710,7 @@ def _build_exec_event(
     outcome: str,
     skipped_legs: Optional[list] = None,
     exposure_source: Optional[str] = None,
+    signal_ts: Optional[int] = None,
 ) -> dict:
     """Build the execution event dict stored in ``_last_execution_event``.
 
@@ -718,6 +729,9 @@ def _build_exec_event(
     all_legs = exit_legs + entry_legs + unwind_legs + skipped_legs
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Signal candle time (epoch s) — the reconciliation join key back to
+        # the model ledger's entry_time/exit_time. None on legacy rows.
+        "signal_ts": signal_ts,
         "prev_pos": prev_pos,
         "new_pos": new_pos,
         "final_pos": final_pos,
@@ -795,6 +809,102 @@ async def _reconcile_and_broadcast() -> None:
         len(legs),
         _last_execution_event.get("outcome"),
         _last_execution_event["all_ok"],
+    )
+
+
+async def _recon_sync_loop() -> None:
+    """Periodic read-only broker history ingest for reconciliation.
+
+    Pulls userTrades + FUNDING_FEE income into the local cache every
+    RECON_SYNC_SECONDS. Paper mode returns unsupported and the loop just
+    idles cheaply. Never raises; a failed sync surfaces as sync.age_s
+    growing in /reconciliation/summary.
+    """
+    while True:
+        try:
+            if broker_client is not None and broker_client.mode == "demo":
+                await asyncio.to_thread(_recon_store.sync, broker_client)
+        except Exception as e:
+            logger.warning(f"recon sync loop error: {e}")
+        await asyncio.sleep(reconciliation.RECON_SYNC_SECONDS)
+
+
+def _load_all_exec_events() -> list:
+    """Full exec-event history, one row per event (reconciled snapshot wins)."""
+    rows = _read_jsonl_tail(EXEC_EVENTS_JSONL, 2000)
+    latest: Dict[str, dict] = {}
+    for row in rows:  # oldest→newest; reconciled rows overwrite submit rows
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            latest[ts] = row
+    return sorted(latest.values(), key=lambda r: r.get("timestamp", ""))
+
+
+def _exchange_net_position() -> Optional[int]:
+    """Infer the ratio position implied by live exchange exposure.
+    1 = long BTC/short ETH, -1 = the reverse, 0 = flat, None = unknown/mixed."""
+    if broker_client is None:
+        return None
+    actual = broker_client.try_get_open_positions()
+    if actual is None:
+        return None
+    net = {s: 0.0 for s in _EXEC_SYMBOLS}
+    for p in actual:
+        if p.get("symbol") in net:
+            signed = p.get("signed_size")
+            if signed is None:
+                signed = p.get("size", 0.0) * (1 if p.get("side") == "LONG" else -1)
+            net[p["symbol"]] = float(signed)
+    btc, eth = net["BTCUSDT"], net["ETHUSDT"]
+    if btc == 0 and eth == 0:
+        return 0
+    if btc > 0 and eth < 0:
+        return 1
+    if btc < 0 and eth > 0:
+        return -1
+    return None  # mixed / one-legged — reported as drift by the caller
+
+
+async def _position_check() -> Dict:
+    """Primary reconciliation invariant: model vs broker-tracked vs exchange."""
+    model_pos = signal_gen.position if signal_gen is not None else None
+    exchange_pos = None
+    if broker_client is not None and broker_client.mode == "demo":
+        exchange_pos = await asyncio.to_thread(_exchange_net_position)
+    known = [p for p in (model_pos, _broker_position, exchange_pos) if p is not None]
+    status = "OK"
+    if len(set(known)) > 1:
+        status = "DRIFT"
+    elif exchange_pos is None and broker_client is not None and broker_client.mode == "demo":
+        status = "UNKNOWN"
+    return {
+        "model_pos": model_pos,
+        "broker_pos": _broker_position,
+        "exchange_pos": exchange_pos,
+        "status": status,
+    }
+
+
+async def _run_reconciliation() -> Dict:
+    """Load all inputs and run the pure engine (see api/reconciliation.py)."""
+    trades: list = []
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            trades = []
+    events = _load_all_exec_events()
+    fills, funding = _recon_store.load()
+    manual_ids = reconciliation.manual_order_ids_from_activity(JSONL_LOG_PATH)
+    eligibility = reconciliation.load_eligibility(execution_control.AUDIT_PATH)
+    pos_check = await _position_check()
+    return reconciliation.reconcile(
+        trades, events, fills, funding,
+        eligibility=eligibility,
+        manual_order_ids=manual_ids,
+        sync_age_s=_recon_store.last_sync_age_s(),
+        position_check=pos_check,
     )
 
 
@@ -918,7 +1028,7 @@ async def _execute_broker_position_change(
             _broker_position = prev_pos
             _last_execution_event = _build_exec_event(
                 prev_pos, new_pos, prev_pos, exit_legs, [], [], "EXIT_PARTIAL_FAILURE",
-                skipped_legs, plan["source"],
+                skipped_legs, plan["source"], signal_ts=timestamp,
             )
             _persist_exec_event(_last_execution_event)
             await broadcast_to_clients({"type": "exec_event", "last_exec": _last_execution_event})
@@ -1007,7 +1117,7 @@ async def _execute_broker_position_change(
     _broker_position = final_pos
     _last_execution_event = _build_exec_event(
         prev_pos, new_pos, final_pos, exit_legs, entry_legs, unwind_legs, outcome,
-        skipped_legs, plan["source"],
+        skipped_legs, plan["source"], signal_ts=timestamp,
     )
     _persist_exec_event(_last_execution_event)
     logger.info(
@@ -1425,6 +1535,10 @@ async def lifespan(app: FastAPI):
     # read module globals at call time so promotions are picked up.
     research_task = asyncio.create_task(strategy_lab.scheduler_loop(
         lambda: (model, feature_names), lambda: MODEL_VERSION))
+
+    # 6. Reconciliation sync loop — read-only broker history ingest (demo
+    # only; the paper broker has no exchange history behind it).
+    recon_task = asyncio.create_task(_recon_sync_loop())
     logger.info("=" * 80)
     logger.info(f"{version.upper()} MODEL SERVER - READY")
     logger.info("=" * 80)
@@ -1433,7 +1547,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down model server...")
-    for task in (data_task, research_task):
+    for task in (data_task, research_task, recon_task):
         task.cancel()
         try:
             await task
@@ -2426,6 +2540,80 @@ async def get_broker_positions(authorization: Optional[str] = Header(None)):
     bc = _broker_or_503()
     positions = await asyncio.to_thread(bc.get_open_positions)
     return {"mode": bc.mode, "positions": positions}
+
+
+# ── Reconciliation (TRADE_RECONCILIATION.md) — all read-only ──────────────
+
+@app.get("/broker/history")
+async def get_broker_history(
+    limit: int = Query(100, ge=1, le=1000),
+    symbol: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Normalized broker fills (userTrades cache), newest first, plus funding.
+
+    This is the broker's own account of what executed — the realized-truth
+    side of reconciliation. Populated by the background sync in demo mode.
+    """
+    _require_auth_or_skip(authorization)
+    fills, funding = _recon_store.load()
+    if symbol:
+        s = symbol.upper()
+        fills = [f for f in fills if f["symbol"] == s]
+        funding = [f for f in funding if f["symbol"] == s]
+    fills = sorted(fills, key=lambda r: r["time_ms"], reverse=True)[:limit]
+    funding = sorted(funding, key=lambda r: r["time_ms"], reverse=True)[:limit]
+    return {
+        "mode": broker_client.mode if broker_client else "none",
+        "fills": fills,
+        "funding": funding,
+        "count": len(fills),
+        "last_sync_age_s": _recon_store.last_sync_age_s(),
+    }
+
+
+@app.get("/reconciliation/summary")
+async def get_reconciliation_summary(authorization: Optional[str] = Header(None)):
+    """Reconciliation health: rates, cost drags, break counts, position parity."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    return {"summary": out["summary"], "mode": broker_client.mode if broker_client else "none"}
+
+
+@app.get("/reconciliation/trades")
+async def get_reconciliation_trades(
+    limit: int = Query(100, ge=1, le=500),
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Reconciled round-trips (model intent × broker execution), newest first."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    rows = out["trades"]
+    if status:
+        rows = [r for r in rows if r["status"] == status.upper()]
+    if severity:
+        rows = [r for r in rows if r["severity"] == severity.lower()]
+    return {"trades": rows[:limit], "count": len(rows), "summary": out["summary"]}
+
+
+@app.get("/reconciliation/breaks")
+async def get_reconciliation_breaks(authorization: Optional[str] = Header(None)):
+    """Warning+critical reconciliation items only (trades, orphans, position)."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    return {"breaks": out["breaks"], "count": len(out["breaks"]), "summary": out["summary"]}
+
+
+@app.post("/reconciliation/sync")
+async def post_reconciliation_sync(authorization: Optional[str] = Header(None)):
+    """Force an immediate broker-history sync (read-only GETs against the
+    exchange; writes only the local cache). Auth-gated like all commands."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    result = await asyncio.to_thread(_recon_store.sync, bc)
+    return {"sync": result, "last_sync_age_s": _recon_store.last_sync_age_s()}
 
 
 @app.post("/trade")

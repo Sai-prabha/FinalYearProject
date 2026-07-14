@@ -167,6 +167,35 @@ class BrokerClient(ABC):
         """
         ...
 
+    # ── Read-only history (reconciliation ingest) ──
+
+    def get_user_trades(
+        self,
+        symbol: str,
+        start_ms: Optional[int] = None,
+        from_id: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Optional[list]:
+        """Account fills for one symbol (GET /fapi/v1/userTrades), raw rows.
+
+        None when the broker has no exchange history behind it (paper mode)
+        or the query fails — callers treat None as "history unavailable",
+        never as "no fills". Never raises, never places orders.
+        """
+        return None
+
+    def get_income(
+        self,
+        income_type: Optional[str] = None,
+        start_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Optional[list]:
+        """Income rows (GET /fapi/v1/income — FUNDING_FEE, COMMISSION, …), raw.
+
+        Same None semantics as ``get_user_trades``. Read-only.
+        """
+        return None
+
     # ── Logging shared by all implementations ──
 
     def _log_interaction(
@@ -599,6 +628,51 @@ class BinanceFuturesBroker(BrokerClient):
             return result
         except Exception as e:
             logger.warning(f"get_order_status {symbol} #{order_id} raised: {e}")
+            return None
+
+    def get_user_trades(
+        self,
+        symbol: str,
+        start_ms: Optional[int] = None,
+        from_id: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Optional[list]:
+        try:
+            params: dict = {"symbol": symbol.upper(), "limit": max(1, min(limit, 1000))}
+            # Binance: fromId cannot be combined with time params; window ≤ 7d.
+            if from_id is not None:
+                params["fromId"] = int(from_id)
+            elif start_ms is not None:
+                params["startTime"] = int(start_ms)
+                params["endTime"] = min(int(start_ms) + 6 * 86_400_000, int(time.time() * 1000))
+            _, body = self._signed_request("GET", "/fapi/v1/userTrades", params)
+            if not isinstance(body, list):
+                logger.warning(f"get_user_trades {symbol}: {body}")
+                return None
+            return body
+        except Exception as e:
+            logger.warning(f"get_user_trades {symbol} raised: {e}")
+            return None
+
+    def get_income(
+        self,
+        income_type: Optional[str] = None,
+        start_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Optional[list]:
+        try:
+            params: dict = {"limit": max(1, min(limit, 1000))}
+            if income_type:
+                params["incomeType"] = income_type
+            if start_ms is not None:
+                params["startTime"] = int(start_ms)
+            _, body = self._signed_request("GET", "/fapi/v1/income", params)
+            if not isinstance(body, list):
+                logger.warning(f"get_income: {body}")
+                return None
+            return body
+        except Exception as e:
+            logger.warning(f"get_income raised: {e}")
             return None
 
 
