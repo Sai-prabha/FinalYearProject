@@ -100,6 +100,21 @@ Non-writer surfaces keep the switch enabled — flipping it is safe by
 construction (the writer gate blocks demo orders on non-writers; paper
 rehearsal remains useful) and the labeling makes scope explicit.
 
+## Deployment status
+
+**Deployed to Railway 2026-07-14** (`b184ef5`, ~3 min auto-deploy). Verified
+live: `/execution/control` auth-gated (401 pre-login); Railway self-identifies
+as writer (`backend: railway, is_writer: true`, replica UUID as instance id —
+zero env configuration needed); `auto_execute: true` survived the deploy via
+`data/live/broker_config.json`. Cross-surface sync, the simultaneous-click
+race (exactly one version bump, loser 409s and refreshes), opposing-intent
+conflicts, and full actor/surface attribution (`adm1nFYP via meridian/vercel`)
+all verified in Chrome against production. A local instance confirmed as
+`observer` — it manages only its own local state and can never place demo
+orders. Note: the audit trail lives in `data/execution/audit.jsonl` on the
+container; there is no read endpoint yet, so production audit rows are
+verifiable only indirectly (metadata transitions + unit-tested write path).
+
 ## Deliberately not built
 
 - No idempotency-key dedupe cache (SET + version already make retries safe).
