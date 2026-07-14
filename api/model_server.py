@@ -23,7 +23,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 
 import secrets
@@ -41,7 +41,7 @@ from xgboost import XGBClassifier
 from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
 from .trade_stats import compute_trade_stats
 from .version_config import get_strategy_config, list_versions, register_version
-from . import execution_control, strategy_lab
+from . import execution_control, ops_audit, simulation_lab, strategy_lab, timing_advisor
 from .broker_client import (
     JSONL_LOG_PATH,
     BrokerClient,
@@ -1255,6 +1255,7 @@ async def process_kline_message(data: Dict):
             "broker": _broker_summary(),
             "last_exec": _last_execution_event,
             "shadow": _shadow_snapshot(),
+            "research_timing": _research_timing_light(),
         },
     }
 
@@ -1495,6 +1496,24 @@ def _verify_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = No
 
 
 # ── Broker helpers ─────────────────────────────────────────────────────────
+
+
+def _research_timing_light() -> Optional[Dict]:
+    """Tiny advisory flag for the WS payload (cached ≤5 min): the frontend
+    toasts on the rising edge. Advisory only — nothing auto-starts."""
+    try:
+        full = timing_advisor.advise_cached(
+            last_success=strategy_lab.load_state().get("last_success"),
+            next_scheduled=strategy_lab.scheduler_snapshot(),
+        )
+        now = full["now"]
+        return {
+            "recommended": now["recommended"],
+            "reason": now["reasons"][0] if now["reasons"] else None,
+            "confidence": now["confidence"],
+        }
+    except Exception:  # the advisor must never take the live loop down
+        return None
 
 
 def _broker_summary() -> Dict:
@@ -1868,6 +1887,7 @@ async def research_status(authorization: Optional[str] = Header(None)):
 
 class ResearchRunRequest(BaseModel):
     depth: str = "deep"
+    pairs: Optional[List[str]] = None  # subset of strategy_lab.PAIR_UNIVERSE
 
 
 @app.post("/research/run")
@@ -1877,13 +1897,23 @@ async def research_run(req: ResearchRunRequest,
     _require_auth_or_skip(authorization)
     try:
         job = strategy_lab.start_research_job(
-            trigger="operator", depth=req.depth,
+            trigger="operator", depth=req.depth, pairs=req.pairs,
             model=model, feature_names=feature_names, live_version=MODEL_VERSION)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "job": job}
+
+
+@app.get("/research/multi-symbol")
+async def research_multi_symbol(authorization: Optional[str] = Header(None)):
+    """Per-pair verdict counts + strategy × pair matrix for the latest run."""
+    _require_auth_or_skip(authorization)
+    data = strategy_lab.load_multi_symbol()
+    if not data:
+        return {"available": False}
+    return {"available": True, "universe": sorted(strategy_lab.PAIR_UNIVERSE), **data}
 
 
 @app.get("/research/candidates")
@@ -1916,6 +1946,12 @@ async def research_register_shadow(cand_id: str, req: ShadowRegisterRequest,
             status_code=409,
             detail=f"Only deploy-candidates enter shadow (lifecycle: {cand.get('lifecycle')}). "
                    "The gates exist so 'deploy-candidate' means something.")
+    if cand.get("pair") not in (None, strategy_lab.DEFAULT_PAIR):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Candidate was evaluated on {cand['pair']} — the live stream trades "
+                   f"{strategy_lab.DEFAULT_PAIR}, so only default-pair candidates can run in "
+                   "shadow. Cross-pair results are robustness evidence, not deployables.")
     if not req.confirm:
         raise HTTPException(status_code=400, detail="Shadow registration replaces the current candidate slot — resend with confirm=true")
 
@@ -1962,6 +1998,124 @@ async def research_stop_shadow(req: ShadowStopRequest,
                                reason="operator stopped shadow evaluation")
     _deactivate_shadow()
     return {"ok": True, "candidate": reg["candidate_id"], "verdict": "SHADOW_REJECTED"}
+
+
+# ── Operator tools: audit readers, timing advisor, simulation ───────────────
+# Read-only investigation + advisory + decision-support surfaces
+# (RESEARCH_TOOLS.md). None of these can reach the broker or the control
+# plane's write path.
+
+
+@app.get("/execution/audit")
+async def get_execution_audit(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = None,
+    actor: Optional[str] = None,
+    via: Optional[str] = None,
+    outcome: Optional[str] = None,
+    event: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Control-plane audit trail, filtered + paginated (newest first). Same
+    auth as the control endpoints — who can change execution control can read
+    its audit."""
+    _require_auth_or_skip(authorization)
+    return ops_audit.read_audit(execution_control.AUDIT_PATH, limit=limit,
+                                cursor=cursor, actor=actor, via=via,
+                                outcome=outcome, event=event, since=since, until=until)
+
+
+@app.get("/execution/audit/summary")
+async def get_execution_audit_summary(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    return ops_audit.audit_summary(execution_control.AUDIT_PATH)
+
+
+@app.get("/research/audit")
+async def get_research_audit(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = None,
+    event: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Strategy-lab / simulation audit trail (runs, lifecycles, shadow events)."""
+    _require_auth_or_skip(authorization)
+    return ops_audit.read_audit(strategy_lab.AUDIT_JSONL, limit=limit,
+                                cursor=cursor, event=event, since=since, until=until)
+
+
+@app.get("/research/timing")
+async def get_research_timing(authorization: Optional[str] = Header(None)):
+    """Timing advisor: recommended research windows + why. Advisory only."""
+    _require_auth_or_skip(authorization)
+    return timing_advisor.advise(
+        last_success=strategy_lab.load_state().get("last_success"),
+        next_scheduled=strategy_lab.scheduler_snapshot(),
+    )
+
+
+class SimulationCampaignRequest(BaseModel):
+    strategy_ids: List[str]
+    label: Optional[str] = None
+    pairs: Optional[List[str]] = None
+    window_days: int = simulation_lab.DEFAULT_WINDOW_DAYS
+    fees: Optional[List[float]] = None
+
+
+@app.post("/simulation/campaign")
+async def create_simulation_campaign(
+    req: SimulationCampaignRequest,
+    authorization: Optional[str] = Header(None),
+    x_control_surface: Optional[str] = Header(None),
+):
+    """Create + start a simulation campaign. Pure replay — no broker writes,
+    no lifecycle changes. 409 while any heavy replay job runs."""
+    _require_auth_or_skip(authorization)
+    try:
+        meta = simulation_lab.create_campaign(
+            strategy_ids=req.strategy_ids, label=req.label, pairs=req.pairs,
+            window_days=req.window_days, fees=req.fees,
+            created_by=_control_actor(authorization),
+            created_via=(x_control_surface or "api").strip().lower()[:32] or "api",
+            model=model, feature_names=feature_names)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "campaign": meta}
+
+
+@app.get("/simulation/campaigns")
+async def list_simulation_campaigns(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    return {"campaigns": simulation_lab.load_campaigns(),
+            "job": simulation_lab.job_snapshot()}
+
+
+@app.get("/simulation/status")
+async def simulation_status(id: str, authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    meta = simulation_lab.get_campaign(id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"Unknown campaign '{id}'")
+    job = simulation_lab.job_snapshot()
+    return {"campaign": meta, "job": job if job.get("id") == id else None}
+
+
+@app.get("/simulation/results")
+async def simulation_results(id: str, authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    meta = simulation_lab.get_campaign(id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"Unknown campaign '{id}'")
+    results = simulation_lab.load_results(id)
+    if results is None:
+        return {"available": False, "campaign": meta}
+    return {"available": True, "campaign": meta, **results}
 
 
 @app.get("/trades")

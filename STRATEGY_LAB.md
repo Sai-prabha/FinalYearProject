@@ -3,6 +3,28 @@
 Architecture decision record for the strategy research platform behind Meridian's
 Backtests module. Read this before touching `api/strategy_lab.py`.
 
+> **Addendum (operator tools build — RESEARCH_TOOLS.md):**
+>
+> - **Multi-pair search**: `POST /research/run` accepts `pairs` (whitelist
+>   `PAIR_UNIVERSE`; BTC-ETH always included). Candidates are replayed per
+>   pair and **all (config × pair) trials pool into one deflated-Sharpe
+>   benchmark** — adding pairs raises the bar for everyone, so multi-symbol
+>   search strengthens the false-discovery discipline. The frozen model is
+>   trained on BTC/ETH; other pairs are cross-pair robustness evidence, and
+>   **only default-pair candidates are shadow-eligible** (enforced with a 400).
+>   Per-pair verdicts: `data/research/multi_symbol.json` / `GET /research/multi-symbol`.
+> - **Simulation campaigns** (`api/simulation_lab.py`, `/simulation/*`):
+>   post-hoc scenario replays (full window / vol-spike week / quiet week) at a
+>   fee band; verdicts (`ROBUST | MIXED | CONFIRMS_REJECT`) never feed back
+>   into ranking or lifecycle; research and simulation are mutually exclusive
+>   so only one heavy replay job runs at a time.
+> - **Timing advisor** (`api/timing_advisor.py`, `GET /research/timing`):
+>   recommends research windows with measurable reasons (UTC-close data
+>   completeness, Saturday liquidity trough, realized-vol regime shift vs the
+>   30d baseline, staleness). Advisory only.
+> - **Audit read APIs**: `GET /research/audit` (this lab's trail) and
+>   `GET /execution/audit` (control plane) feed Meridian's Ops timeline.
+
 ## What "strategy search" means here
 
 The alpha model is frozen (v4.14 XGBoost weights, AUC≈0.52). Every live version

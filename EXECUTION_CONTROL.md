@@ -115,6 +115,16 @@ orders. Note: the audit trail lives in `data/execution/audit.jsonl` on the
 container; there is no read endpoint yet, so production audit rows are
 verifiable only indirectly (metadata transitions + unit-tested write path).
 
+## Reading the trail
+
+`GET /execution/audit` (filters: actor/via/outcome/event/since/until, cursor
+pagination) and `GET /execution/audit/summary` expose this file read-only,
+behind the same auth as the control endpoints. Meridian's **Ops module**
+renders it as an investigative timeline — the control card's "last change
+by …" line links straight into it. Design: RESEARCH_TOOLS.md §2. Rejected
+stale writes (409s) appear as `conflict` rows: that is the race protection
+working, not an error.
+
 ## Deliberately not built
 
 - No idempotency-key dedupe cache (SET + version already make retries safe).

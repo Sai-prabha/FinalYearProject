@@ -56,6 +56,37 @@ PRIMARY_FEE = 4.5
 MIN_DATASET_DAYS = HOLDOUT_DAYS + 60
 _EULER_GAMMA = 0.5772156649015329
 
+# ── Pair universe (multi-symbol search, RESEARCH_TOOLS.md §3) ───────────────
+# The frozen model was trained on BTC/ETH; every other pair is a cross-pair
+# robustness/transfer test, not a deployment menu. Liquid USDT-margined legs
+# with multi-year history only. The universe grows with a written rationale,
+# same rule as strategy families. Every run includes the default pair so the
+# live baseline is always the comparison bar.
+
+PAIR_UNIVERSE: Dict[str, Tuple[str, str]] = {
+    "BTC-ETH": ("BTCUSDT", "ETHUSDT"),   # the live pair (model's home)
+    "SOL-ETH": ("SOLUSDT", "ETHUSDT"),
+    "BNB-ETH": ("BNBUSDT", "ETHUSDT"),
+    "SOL-BTC": ("SOLUSDT", "BTCUSDT"),
+}
+DEFAULT_PAIR = "BTC-ETH"
+
+# Cross-job mutual exclusion: other heavy replay users (simulation_lab)
+# register a checker so research and simulation never run concurrently and
+# the live signal loop is never starved by two replay engines.
+external_busy_checks: List[Callable[[], Optional[str]]] = []
+
+
+def _external_busy() -> Optional[str]:
+    for check in external_busy_checks:
+        try:
+            reason = check()
+            if reason:
+                return reason
+        except Exception:
+            continue
+    return None
+
 # ── Search space ────────────────────────────────────────────────────────────
 # Small and explainable by design: every trial raises the deflated-Sharpe bar
 # for all trials, so families only grow with a written rationale.
@@ -173,12 +204,21 @@ def _load_model():
 
 
 def build_dataset(lookback_days: int, model=None, feature_names=None,
-                  fetch_missing: bool = True, now: Optional[datetime] = None):
+                  fetch_missing: bool = True, now: Optional[datetime] = None,
+                  pair_key: str = DEFAULT_PAIR):
     """(time, ratio, proba, valid) frame for the last N days ending at the last
     complete UTC day. Reuses every cached proba parquet that overlaps; computes
-    (and caches) only the missing tail from public Binance klines."""
+    (and caches) only the missing tail from public Binance klines.
+
+    ``pair_key`` selects the leg pair from PAIR_UNIVERSE. The default pair
+    keeps the legacy ``probas_{start}_{end}.parquet`` cache names; other pairs
+    are namespaced ``probas_{PAIR}_{start}_{end}.parquet``."""
     import pandas as pd
     from scripts.fast_backtest import CACHE_DIR, compute_probas, fetch_klines
+
+    if pair_key not in PAIR_UNIVERSE:
+        raise ValueError(f"unknown pair '{pair_key}' — universe: {sorted(PAIR_UNIVERSE)}")
+    leg1_sym, leg2_sym = PAIR_UNIVERSE[pair_key]
 
     now = now or datetime.now(timezone.utc)
     end_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -187,10 +227,14 @@ def build_dataset(lookback_days: int, model=None, feature_names=None,
     end_s = int(end_dt.timestamp())
     head_s = start_s - (WARMUP + 800) * 60  # replay warm-up runway
 
+    default_pair = pair_key == DEFAULT_PAIR
+    glob_pat = "probas_*.parquet" if default_pair else f"probas_{pair_key}_*.parquet"
+    idx = slice(1, 3) if default_pair else slice(2, 4)
     frames = []
-    for p in sorted(CACHE_DIR.glob("probas_*.parquet")):
+    for p in sorted(CACHE_DIR.glob(glob_pat)):
         try:
-            s_ms, e_ms = (int(x) for x in p.stem.split("_")[1:3])
+            # the default pair's int() parse naturally skips pair-prefixed files
+            s_ms, e_ms = (int(x) for x in p.stem.split("_")[idx])
         except (ValueError, IndexError):
             continue
         if e_ms // 1000 < head_s or s_ms // 1000 > end_s:
@@ -209,11 +253,13 @@ def build_dataset(lookback_days: int, model=None, feature_names=None,
         if model is None:
             model, feature_names = _load_model()
         fetch_start_s = (last_s - 1800 * 60) if last_s else head_s
-        logger.info(f"Strategy lab: fetching klines {fetch_start_s} → {end_s}")
-        btc = fetch_klines("BTCUSDT", fetch_start_s * 1000, end_s * 1000)
-        eth = fetch_klines("ETHUSDT", fetch_start_s * 1000, end_s * 1000)
-        fresh = compute_probas(btc, eth, model, feature_names)
-        fresh.to_parquet(CACHE_DIR / f"probas_{fetch_start_s * 1000}_{end_s * 1000}.parquet")
+        logger.info(f"Strategy lab: fetching {pair_key} klines {fetch_start_s} → {end_s}")
+        leg1 = fetch_klines(leg1_sym, fetch_start_s * 1000, end_s * 1000)
+        leg2 = fetch_klines(leg2_sym, fetch_start_s * 1000, end_s * 1000)
+        fresh = compute_probas(leg1, leg2, model, feature_names)
+        cache_name = (f"probas_{fetch_start_s * 1000}_{end_s * 1000}.parquet" if default_pair
+                      else f"probas_{pair_key}_{fetch_start_s * 1000}_{end_s * 1000}.parquet")
+        fresh.to_parquet(CACHE_DIR / cache_name)
         df = pd.concat([df, fresh], ignore_index=True)
         df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
         df = df[df["time"] >= head_s].reset_index(drop=True)
@@ -303,48 +349,79 @@ def _neighbors(spec: Dict, all_specs: List[Dict]) -> List[str]:
     return out
 
 
-def evaluate_run(dataset, specs: List[Dict], live_version: str,
+def evaluate_run(datasets, specs: List[Dict], live_version: str,
                  progress: Optional[Callable[[str, int, int], None]] = None) -> Dict:
     """Replay every spec over the validation span (+ fee sensitivity), gate,
-    rank, and holdout-test the top-5 gate passers. Pure computation — no I/O."""
+    rank, and holdout-test the top-5 gate passers. Pure computation — no I/O.
+
+    ``datasets`` is either a single dataset (default pair, legacy call shape)
+    or ``{pair_key: dataset}``. Candidates are replayed on every pair;
+    baselines only on the default pair (they ARE BTC-ETH strategies). All
+    (config × pair) trials pool into ONE deflated-Sharpe benchmark — adding
+    pairs raises everyone's bar. Non-default-pair rows get ids
+    ``{spec_id}@{PAIR}`` and a ``pair`` field."""
     import numpy as np
     from scripts.fast_backtest import compute_metrics, replay
 
-    times = dataset["time"].to_numpy()
-    end_s = float(times[-1])
-    holdout_start_s = end_s - HOLDOUT_DAYS * 86400
-    h_idx = int(np.searchsorted(times, holdout_start_s))
-    if h_idx <= WARMUP:
-        raise RuntimeError("Dataset too small for the holdout split")
-    val = dataset.iloc[:h_idx].reset_index(drop=True)
-    hold = dataset.iloc[h_idx - WARMUP:].reset_index(drop=True)
-    val_t_start = float(times[WARMUP])
+    if not isinstance(datasets, dict):
+        datasets = {DEFAULT_PAIR: datasets}
+    if DEFAULT_PAIR not in datasets:
+        raise ValueError(f"every run must include the default pair {DEFAULT_PAIR}")
+    pair_keys = list(datasets.keys())
+    multi = len(pair_keys) > 1
 
-    total = len(specs)
+    slices: Dict[str, Dict] = {}
+    ds_meta: Dict[str, Dict] = {}
+    for pk, dataset in datasets.items():
+        times = dataset["time"].to_numpy()
+        end_s = float(times[-1])
+        holdout_start_s = end_s - HOLDOUT_DAYS * 86400
+        h_idx = int(np.searchsorted(times, holdout_start_s))
+        if h_idx <= WARMUP:
+            raise RuntimeError(f"Dataset too small for the holdout split ({pk})")
+        slices[pk] = {
+            "val": dataset.iloc[:h_idx].reset_index(drop=True),
+            "hold": dataset.iloc[h_idx - WARMUP:].reset_index(drop=True),
+            "val_t_start": float(times[WARMUP]),
+            "holdout_start_s": holdout_start_s,
+        }
+        ds_meta[pk] = {"from": int(times[0]), "to": int(end_s), "bars": int(len(dataset)),
+                       "holdout_from": int(holdout_start_s), "folds": N_FOLDS,
+                       "fee_bps_per_side": PRIMARY_FEE}
+
+    total = sum(len(pair_keys) if s["role"] == "candidate" else 1 for s in specs)
     rows: List[Dict] = []
-    for k, spec in enumerate(specs):
-        if progress:
-            progress(f"replaying {spec['label']}", k, total)
-        fees = {}
-        primary = None
-        for fee in FEE_GRID:
-            trades, equity, _ = replay(spec["id"], val, fee, sig_gen=_make_gen(spec))
-            m = compute_metrics(trades, equity, net=True)
-            fees[f"{fee:g}"] = m.get("expectancy_pct")
-            if fee == PRIMARY_FEE:
-                primary = (trades, equity, m)
-        trades, equity, m = primary
-        folds = _fold_slices(trades, val_t_start, holdout_start_s, N_FOLDS)
-        consistency = sum(1 for f in folds if f["positive"]) / N_FOLDS
-        dd_pct = _equity_max_dd_pct(equity)
-        n = m.get("n_trades", 0)
-        exp = m.get("expectancy_pct")
-        dols = [t["pnl_dollar_net"] for t in trades]
-        gross_profit = sum(d for d in dols if d > 0)
-        concentration = (max(dols) / gross_profit) if (dols and gross_profit > 0) else None
-        rows.append({
-            **spec,
-            "metrics": {
+    k = 0
+    for spec in specs:
+        spec_pairs = [DEFAULT_PAIR] if spec["role"] == "baseline" else pair_keys
+        for pk in spec_pairs:
+            if progress:
+                progress(f"replaying {spec['label']}" + (f" · {pk}" if multi else ""), k, total)
+            k += 1
+            sl = slices[pk]
+            fees = {}
+            primary = None
+            for fee in FEE_GRID:
+                trades, equity, _ = replay(spec["id"], sl["val"], fee, sig_gen=_make_gen(spec))
+                m = compute_metrics(trades, equity, net=True)
+                fees[f"{fee:g}"] = m.get("expectancy_pct")
+                if fee == PRIMARY_FEE:
+                    primary = (trades, equity, m)
+            trades, equity, m = primary
+            folds = _fold_slices(trades, sl["val_t_start"], sl["holdout_start_s"], N_FOLDS)
+            consistency = sum(1 for f in folds if f["positive"]) / N_FOLDS
+            dd_pct = _equity_max_dd_pct(equity)
+            n = m.get("n_trades", 0)
+            exp = m.get("expectancy_pct")
+            dols = [t["pnl_dollar_net"] for t in trades]
+            gross_profit = sum(d for d in dols if d > 0)
+            concentration = (max(dols) / gross_profit) if (dols and gross_profit > 0) else None
+            rows.append({
+                **spec,
+                "id": spec["id"] if pk == DEFAULT_PAIR else f"{spec['id']}@{pk}",
+                "label": spec["label"] if pk == DEFAULT_PAIR else f"{spec['label']} · {pk}",
+                "pair": pk,
+                "metrics": {
                 "n_trades": n,
                 "exp_pct": exp,
                 "profit_factor": m.get("profit_factor"),
@@ -374,7 +451,9 @@ def evaluate_run(dataset, specs: List[Dict], live_version: str,
         if r["role"] != "candidate":
             continue
         m = r["metrics"]
-        neigh = _neighbors(r, rows)
+        # neighborhood is within-pair: a SOL-ETH grid point is not evidence
+        # about the BTC-ETH parameter surface
+        neigh = _neighbors(r, [x for x in rows if x.get("pair") == r.get("pair")])
         neigh_scores = sorted(by_id[i]["score"] for i in neigh if i in by_id)
         neigh_median = neigh_scores[len(neigh_scores) // 2] if neigh_scores else None
         real_folds = [f for f in r["folds"] if f["n"] >= 3]
@@ -408,6 +487,7 @@ def evaluate_run(dataset, specs: List[Dict], live_version: str,
         if j < 5:
             if progress:
                 progress(f"holdout {r['label']}", total, total)
+            hold = slices[r.get("pair", DEFAULT_PAIR)]["hold"]
             trades, equity, _ = replay(r["id"], hold, PRIMARY_FEE, sig_gen=_make_gen(r))
             hm = compute_metrics(trades, equity, net=True)
             ok = (hm.get("expectancy_pct") or 0) > 0 and (hm.get("profit_factor") or 0) >= 1.0
@@ -459,13 +539,9 @@ def evaluate_run(dataset, specs: List[Dict], live_version: str,
         "sr_benchmark": sr_benchmark,
         "baseline_version": live_version,
         "baseline_score": baseline_score,
-        "dataset": {
-            "from": int(times[0]), "to": int(end_s),
-            "bars": int(len(dataset)),
-            "holdout_from": int(holdout_start_s),
-            "folds": N_FOLDS,
-            "fee_bps_per_side": PRIMARY_FEE,
-        },
+        "pairs": pair_keys,
+        "dataset": ds_meta[DEFAULT_PAIR],  # legacy shape (default pair)
+        "datasets": ds_meta,
         "candidates": ranked,
     }
 
@@ -516,7 +592,56 @@ def _persist_run(result: Dict, run_id: str, trigger: str, depth: str) -> Dict:
     }
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
     CANDIDATES_JSON.write_text(json.dumps(store, indent=2, default=str))
+    _write_multi_symbol(store)
     return store
+
+
+MULTI_SYMBOL_JSON = RESEARCH_DIR / "multi_symbol.json"
+
+
+def _write_multi_symbol(store: Dict) -> None:
+    """Per-pair verdict counts + the strategy × pair lifecycle matrix for the
+    latest run (data/research/multi_symbol.json)."""
+    pairs = store.get("pairs") or [DEFAULT_PAIR]
+    per_pair: Dict[str, Dict[str, int]] = {pk: {} for pk in pairs}
+    matrix: Dict[str, Dict] = {}
+    for c in store["candidates"]:
+        if c.get("role") != "candidate":
+            continue
+        pk = c.get("pair", DEFAULT_PAIR)
+        counts = per_pair.setdefault(pk, {})
+        counts[c["lifecycle"]] = counts.get(c["lifecycle"], 0) + 1
+        base_id = c["id"].split("@")[0]
+        metrics = c.get("metrics") or {}
+        entry = matrix.setdefault(base_id, {
+            "id": base_id,
+            "family": c.get("family"),
+            "label": str(c.get("label", base_id)).removesuffix(f" · {pk}"),
+            "per_pair": {},
+        })
+        entry["per_pair"][pk] = {
+            "lifecycle": c["lifecycle"],
+            "score": c.get("score"),
+            "exp_pct": metrics.get("exp_pct"),
+            "n_trades": metrics.get("n_trades"),
+        }
+    MULTI_SYMBOL_JSON.write_text(json.dumps({
+        "run_id": store["run_id"],
+        "generated": store["generated"],
+        "pairs": pairs,
+        "per_pair": per_pair,
+        "matrix": list(matrix.values()),
+    }, indent=2, default=str))
+
+
+def load_multi_symbol() -> Optional[Dict]:
+    if not MULTI_SYMBOL_JSON.exists():
+        return None
+    try:
+        return json.loads(MULTI_SYMBOL_JSON.read_text())
+    except Exception as e:
+        logger.warning(f"multi_symbol.json unreadable: {e}")
+        return None
 
 
 def _save_state(**fields) -> None:
@@ -555,11 +680,21 @@ DEPTHS = {"daily": 180, "deep": 270}  # lookback days
 
 
 def start_research_job(trigger: str, depth: str = "deep",
-                       model=None, feature_names=None, live_version: str = "v4.15") -> Dict:
+                       model=None, feature_names=None, live_version: str = "v4.15",
+                       pairs: Optional[List[str]] = None) -> Dict:
     """Kick off a research run in a worker thread. Raises RuntimeError if one
-    is already running (single-job guard — research never competes with itself)."""
+    is already running (single-job guard — research never competes with itself,
+    or with a simulation campaign)."""
     if depth not in DEPTHS:
         raise ValueError(f"depth must be one of {sorted(DEPTHS)}")
+    # the default pair is always included — the live baseline is the bar
+    pairs = list(dict.fromkeys([DEFAULT_PAIR] + (pairs or [])))
+    unknown = [p for p in pairs if p not in PAIR_UNIVERSE]
+    if unknown:
+        raise ValueError(f"unknown pairs {unknown} — universe: {sorted(PAIR_UNIVERSE)}")
+    busy = _external_busy()
+    if busy:
+        raise RuntimeError(busy)
     with _job_lock:
         if _job.get("state") == "running":
             raise RuntimeError("A research job is already running")
@@ -567,31 +702,36 @@ def start_research_job(trigger: str, depth: str = "deep",
         _job.clear()
         _job.update({
             "state": "running", "run_id": run_id, "trigger": trigger, "depth": depth,
-            "phase": "starting", "done": 0, "total": 0,
+            "pairs": pairs, "phase": "starting", "done": 0, "total": 0,
             "started": datetime.now(timezone.utc).isoformat(), "finished": None, "error": None,
         })
-    _audit("run_started", run_id=run_id, trigger=trigger, depth=depth)
+    _audit("run_started", run_id=run_id, trigger=trigger, depth=depth, pairs=pairs)
     t = threading.Thread(
         target=_run_research_sync,
-        args=(run_id, trigger, depth, model, feature_names, live_version),
+        args=(run_id, trigger, depth, model, feature_names, live_version, pairs),
         daemon=True, name=f"strategy-lab-{run_id}")
     t.start()
     return job_snapshot()
 
 
 def _run_research_sync(run_id: str, trigger: str, depth: str,
-                       model, feature_names, live_version: str) -> None:
+                       model, feature_names, live_version: str,
+                       pairs: Optional[List[str]] = None) -> None:
     t0 = time.time()
+    pairs = pairs or [DEFAULT_PAIR]
     try:
-        _set_job(phase="building dataset")
-        dataset = build_dataset(DEPTHS[depth], model=model, feature_names=feature_names)
+        datasets = {}
+        for pk in pairs:
+            _set_job(phase=f"building dataset · {pk}")
+            datasets[pk] = build_dataset(DEPTHS[depth], model=model,
+                                         feature_names=feature_names, pair_key=pk)
         specs = build_candidate_specs()
         _set_job(total=len(specs))
 
         def progress(phase: str, done: int, total: int) -> None:
             _set_job(phase=phase, done=done, total=total)
 
-        result = evaluate_run(dataset, specs, live_version, progress=progress)
+        result = evaluate_run(datasets, specs, live_version, progress=progress)
         _set_job(phase="ranking + persisting")
         store = _persist_run(result, run_id, trigger, depth)
         duration = round(time.time() - t0, 1)
